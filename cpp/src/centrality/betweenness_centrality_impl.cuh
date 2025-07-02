@@ -336,6 +336,9 @@ void accumulate_vertex_results(
   for (vertex_t d = diameter; d > 1; --d) {
     std::cout << "DEBUG: Processing distance level d=" << d << std::endl;
     
+    // Clear deltas array for this iteration
+    detail::scalar_fill(handle, deltas.data(), deltas.size(), weight_t{0});
+    
     // Track delta values before processing this level
     std::vector<weight_t> h_deltas_before(deltas.size());
     raft::copy(h_deltas_before.data(), deltas.data(), deltas.size(), handle.get_stream());
