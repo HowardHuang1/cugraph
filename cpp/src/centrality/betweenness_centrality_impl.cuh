@@ -413,6 +413,9 @@ void accumulate_vertex_results(
       key_bucket_t<vertex_t, void, multi_gpu, true> vertex_list(
         handle, std::move(vertices_at_distance_d_minus_1));
       
+      // Create temporary array for vertex list results
+      rmm::device_uvector<weight_t> vertex_list_deltas(vertex_list.size(), handle.get_stream());
+      
       // Use vertex list approach - only process vertices at distance d-1
       per_v_transform_reduce_outgoing_e(
         handle,
@@ -434,8 +437,18 @@ void accumulate_vertex_results(
         },
         weight_t{0},
         reduce_op::plus<weight_t>{},
-        deltas.begin(),
+        vertex_list_deltas.begin(),
         do_expensive_check);
+      
+      // Scatter results back to correct positions in main deltas array
+      auto v_first = graph_view.local_vertex_partition_range_first();
+      thrust::scatter(
+        handle.get_thrust_policy(),
+        vertex_list_deltas.begin(),
+        vertex_list_deltas.end(),
+        vertex_list.begin(),
+        deltas.begin() + v_first
+      );
     }
     
     // Track delta values after processing this level
