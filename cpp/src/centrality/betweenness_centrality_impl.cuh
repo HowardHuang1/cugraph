@@ -41,6 +41,11 @@
 #include <cuda/std/optional>
 #include <thrust/functional.h>
 #include <thrust/reduce.h>
+#include <chrono>
+#include <vector>
+#include <algorithm>
+#include <numeric>
+#include <cmath>
 
 //
 // The formula for BC(v) is the sum over all (s,t) where s != v != t of
@@ -142,6 +147,10 @@ std::tuple<rmm::device_uvector<vertex_t>, rmm::device_uvector<edge_t>> brandes_b
   constexpr size_t bucket_idx_cur{0};
   constexpr size_t bucket_idx_next{1};
 
+  // Time BFS initialization
+  RAFT_CUDA_TRY(cudaDeviceSynchronize());
+  auto bfs_init_start = std::chrono::high_resolution_clock::now();
+
   rmm::device_uvector<edge_t> sigmas(graph_view.local_vertex_partition_range_size(),
                                      handle.get_stream());
   rmm::device_uvector<vertex_t> distances(graph_view.local_vertex_partition_range_size(),
@@ -168,12 +177,36 @@ std::tuple<rmm::device_uvector<vertex_t>, rmm::device_uvector<edge_t>> brandes_b
       });
   }
 
+  RAFT_CUDA_TRY(cudaDeviceSynchronize());
+  auto bfs_init_end = std::chrono::high_resolution_clock::now();
+  auto bfs_init_duration = std::chrono::duration_cast<std::chrono::microseconds>(bfs_init_end - bfs_init_start);
+  std::cout << "DEBUG: BFS init time: " << bfs_init_duration.count() << " microseconds" << std::endl;
+
+  // Time the main BFS loop
+  RAFT_CUDA_TRY(cudaDeviceSynchronize());
+  auto bfs_loop_start = std::chrono::high_resolution_clock::now();
+  
   edge_t hop{0};
+  int iteration_count = 0;
 
   while (true) {
+    iteration_count++;
+    
+    // Time edge property updates within BFS
+    RAFT_CUDA_TRY(cudaDeviceSynchronize());
+    auto edge_update_start = std::chrono::high_resolution_clock::now();
+    
     update_edge_src_property(handle, graph_view, sigmas.begin(), src_sigmas.mutable_view());
     update_edge_dst_property(handle, graph_view, distances.begin(), dst_distances.mutable_view());
-
+    
+    RAFT_CUDA_TRY(cudaDeviceSynchronize());
+    auto edge_update_end = std::chrono::high_resolution_clock::now();
+    auto edge_update_duration = std::chrono::duration_cast<std::chrono::microseconds>(edge_update_end - edge_update_start);
+    
+    // Time the main BFS expansion
+    RAFT_CUDA_TRY(cudaDeviceSynchronize());
+    auto expansion_start = std::chrono::high_resolution_clock::now();
+    
     auto [new_frontier, new_sigma] = cugraph::transform_reduce_if_v_frontier_outgoing_e_by_dst(
       handle,
       graph_view,
@@ -200,6 +233,10 @@ std::tuple<rmm::device_uvector<vertex_t>, rmm::device_uvector<edge_t>> brandes_b
                           cuda::std::make_optional(bucket_idx_next),
                           cuda::std::make_optional(thrust::make_tuple(hop + 1, v_sigma)));
                       });
+    
+    RAFT_CUDA_TRY(cudaDeviceSynchronize());
+    auto expansion_end = std::chrono::high_resolution_clock::now();
+    auto expansion_duration = std::chrono::duration_cast<std::chrono::microseconds>(expansion_end - expansion_start);
 
     vertex_frontier.bucket(bucket_idx_cur).clear();
     vertex_frontier.bucket(bucket_idx_cur).shrink_to_fit();
@@ -207,7 +244,18 @@ std::tuple<rmm::device_uvector<vertex_t>, rmm::device_uvector<edge_t>> brandes_b
     if (vertex_frontier.bucket(bucket_idx_cur).aggregate_size() == 0) { break; }
 
     ++hop;
+    
+    // Print timing for first few iterations to see the pattern
+    if (iteration_count <= 5) {
+      std::cout << "DEBUG: BFS iteration " << iteration_count << " - Edge update: " << edge_update_duration.count() 
+                << ", Expansion: " << expansion_duration.count() << " microseconds" << std::endl;
+    }
   }
+  
+  RAFT_CUDA_TRY(cudaDeviceSynchronize());
+  auto bfs_loop_end = std::chrono::high_resolution_clock::now();
+  auto bfs_loop_duration = std::chrono::duration_cast<std::chrono::microseconds>(bfs_loop_end - bfs_loop_start);
+  std::cout << "DEBUG: BFS loop time: " << bfs_loop_duration.count() << " microseconds (" << iteration_count << " iterations)" << std::endl;
 
   return std::make_tuple(std::move(distances), std::move(sigmas));
 }
@@ -225,6 +273,10 @@ void accumulate_vertex_results(
 {
   constexpr vertex_t invalid_distance = std::numeric_limits<vertex_t>::max();
 
+  // Time initial setup
+  RAFT_CUDA_TRY(cudaDeviceSynchronize());
+  auto setup_start = std::chrono::high_resolution_clock::now();
+  
   vertex_t diameter = transform_reduce_v(
     handle,
     graph_view,
@@ -260,7 +312,16 @@ void accumulate_vertex_results(
                         }
                       });
   }
+  
+  RAFT_CUDA_TRY(cudaDeviceSynchronize());
+  auto setup_end = std::chrono::high_resolution_clock::now();
+  auto setup_duration = std::chrono::duration_cast<std::chrono::microseconds>(setup_end - setup_start);
+  std::cout << "DEBUG: Setup time: " << setup_duration.count() << " microseconds" << std::endl;
 
+  // Time edge property updates
+  RAFT_CUDA_TRY(cudaDeviceSynchronize());
+  auto edge_prop_start = std::chrono::high_resolution_clock::now();
+  
   edge_src_property_t<vertex_t, thrust::tuple<vertex_t, edge_t, weight_t>> src_properties(
     handle, graph_view);
   edge_dst_property_t<vertex_t, thrust::tuple<vertex_t, edge_t, weight_t>> dst_properties(
@@ -276,6 +337,33 @@ void accumulate_vertex_results(
     graph_view,
     thrust::make_zip_iterator(distances.begin(), sigmas.begin(), deltas.begin()),
     dst_properties.mutable_view());
+  
+  RAFT_CUDA_TRY(cudaDeviceSynchronize());
+  auto edge_prop_end = std::chrono::high_resolution_clock::now();
+  auto edge_prop_duration = std::chrono::duration_cast<std::chrono::microseconds>(edge_prop_end - edge_prop_start);
+  std::cout << "DEBUG: Edge property update time: " << edge_prop_duration.count() << " microseconds" << std::endl;
+
+  // Time buffer allocation
+  RAFT_CUDA_TRY(cudaDeviceSynchronize());
+  auto alloc_start = std::chrono::high_resolution_clock::now();
+  
+  auto max_frontier_size = transform_reduce_v(
+    handle,
+    graph_view,
+    distances.begin(),
+    [] __device__(auto, auto d) { return (d == invalid_distance) ? vertex_t{0} : vertex_t{1}; },
+    vertex_t{0},
+    reduce_op::plus<vertex_t>{},
+    do_expensive_check);
+  
+  rmm::device_uvector<vertex_t> reusable_vertex_buffer(max_frontier_size, handle.get_stream());
+  rmm::device_uvector<weight_t> reusable_delta_buffer(max_frontier_size, handle.get_stream());
+  rmm::device_uvector<weight_t> reusable_centrality_buffer(max_frontier_size, handle.get_stream());
+  
+  RAFT_CUDA_TRY(cudaDeviceSynchronize());
+  auto alloc_end = std::chrono::high_resolution_clock::now();
+  auto alloc_duration = std::chrono::duration_cast<std::chrono::microseconds>(alloc_end - alloc_start);
+  std::cout << "DEBUG: Buffer allocation time: " << alloc_duration.count() << " microseconds" << std::endl;
 
   // Print distances array for debugging
   std::cout << "DEBUG: Distances array size: " << distances.size() << std::endl;
@@ -333,6 +421,9 @@ void accumulate_vertex_results(
   // Based on Brandes algorithm, we want to follow back pointers in non-increasing
   // distance from S to compute delta
   //
+  RAFT_CUDA_TRY(cudaDeviceSynchronize());
+  auto loop_start = std::chrono::high_resolution_clock::now();
+  
   for (vertex_t d = diameter; d > 1; --d) {
     std::cout << "DEBUG: Processing distance level d=" << d << std::endl;
     
@@ -447,6 +538,60 @@ void accumulate_vertex_results(
       auto v_first = graph_view.local_vertex_partition_range_first();
       thrust::scatter(
         handle.get_thrust_policy(),
+        reusable_delta_buffer.begin(),
+        reusable_delta_buffer.begin() + frontier_count,
+        reusable_vertex_buffer.begin(),
+        deltas.begin()
+      );
+      
+      // Update edge properties with current deltas
+      update_edge_src_property(
+        handle,
+        graph_view,
+        vertex_list.begin(),
+        vertex_list.end(),
+        thrust::make_zip_iterator(distances.begin(), sigmas.begin(), deltas.begin()),
+        src_properties.mutable_view());
+      update_edge_dst_property(
+        handle,
+        graph_view,
+        vertex_list.begin(),
+        vertex_list.end(),
+        thrust::make_zip_iterator(distances.begin(), sigmas.begin(), deltas.begin()),
+        dst_properties.mutable_view());
+
+      // Update centrality values for frontier vertices
+      thrust::gather(
+        handle.get_thrust_policy(),
+        reusable_vertex_buffer.begin(),
+        reusable_vertex_buffer.begin() + frontier_count,
+        centralities.begin(),
+        reusable_centrality_buffer.begin()
+      );
+      
+      thrust::transform(
+        handle.get_thrust_policy(),
+        reusable_centrality_buffer.begin(),
+        reusable_centrality_buffer.begin() + frontier_count,
+        reusable_delta_buffer.begin(),
+        reusable_centrality_buffer.begin(),
+        thrust::plus<weight_t>()
+      );
+      
+      thrust::scatter(
+        handle.get_thrust_policy(),
+        reusable_centrality_buffer.begin(),
+        reusable_centrality_buffer.begin() + frontier_count,
+        reusable_vertex_buffer.begin(),
+        centralities.begin()
+      );
+    }
+  }
+  
+  RAFT_CUDA_TRY(cudaDeviceSynchronize());
+  auto loop_end = std::chrono::high_resolution_clock::now();
+  auto loop_duration = std::chrono::duration_cast<std::chrono::microseconds>(loop_end - loop_start);
+  std::cout << "DEBUG: Distance loop time (1 source): " << loop_duration.count() << " microseconds" << std::endl;
         vertex_list_deltas.begin(),
         vertex_list_deltas.end(),
         vertex_list.begin(),
@@ -757,6 +902,115 @@ rmm::device_uvector<weight_t> betweenness_centrality(
   // expand from multiple sources concurrently. The challenge is managing
   // the memory explosion.
   //
+  
+  // Calculate and print diameter using the two-BFS algorithm
+  // First BFS: from any vertex to find the farthest vertex
+  // Second BFS: from the farthest vertex to find the true diameter
+  if (num_sources > 0) {
+    constexpr vertex_t invalid_distance = std::numeric_limits<vertex_t>::max();
+    
+    std::cout << "DEBUG: Starting two-BFS diameter calculation..." << std::endl;
+    
+    // First BFS: from vertex 0 to find the farthest vertex
+    vertex_frontier_t<vertex_t, void, multi_gpu, true> temp_frontier1(handle, 2);
+    if ((0 >= source_offsets[my_rank]) && (0 < source_offsets[my_rank + 1])) {
+      temp_frontier1.bucket(0).insert(vertices_begin, vertices_begin + 1);
+    }
+    
+    std::cout << "DEBUG: Running first BFS..." << std::endl;
+    auto [temp_distances1, temp_sigmas1] = brandes_bfs(handle, graph_view, edge_weight_view, temp_frontier1, do_expensive_check);
+    std::cout << "DEBUG: First BFS completed successfully" << std::endl;
+    
+    // Find the farthest vertex from vertex 0 using a simpler approach
+    std::cout << "DEBUG: Finding farthest vertex..." << std::endl;
+    vertex_t farthest_vertex = 0;
+    vertex_t first_max_distance = 0;
+    
+    // Use a simple reduction to find max distance
+    auto max_distance_result = transform_reduce_v(
+      handle,
+      graph_view,
+      temp_distances1.begin(),
+      [] __device__(auto, auto d) { return (d == invalid_distance) ? vertex_t{0} : d; },
+      vertex_t{0},
+      reduce_op::maximum<vertex_t>{},
+      do_expensive_check);
+    
+    first_max_distance = max_distance_result;
+    
+    // Find the vertex with this maximum distance
+    auto v_first = graph_view.local_vertex_partition_range_first();
+    auto v_last = graph_view.local_vertex_partition_range_last();
+    
+    // Copy distances to host for searching
+    std::vector<vertex_t> host_distances(temp_distances1.size());
+    raft::update_host(host_distances.data(), temp_distances1.data(), temp_distances1.size(), handle.get_stream());
+    handle.sync_stream();
+    
+    for (vertex_t v = v_first; v < v_last; ++v) {
+      auto offset = v - v_first;
+      if (host_distances[offset] == first_max_distance) {
+        farthest_vertex = v;
+        break;
+      }
+    }
+    
+    // In multi-GPU case, we need to find the global farthest vertex
+    if constexpr (multi_gpu) {
+      auto local_farthest_vertex = farthest_vertex;
+      auto local_max_distance = first_max_distance;
+      
+      auto global_farthest_vertex = host_scalar_allreduce(
+        handle.get_comms(), 
+        local_max_distance == first_max_distance ? local_farthest_vertex : std::numeric_limits<vertex_t>::max(),
+        raft::comms::op_t::MIN,
+        handle.get_stream());
+      
+      farthest_vertex = global_farthest_vertex;
+    }
+    
+    // Ensure the farthest vertex is valid
+    if (farthest_vertex == std::numeric_limits<vertex_t>::max()) {
+      std::cout << "DEBUG: Warning - no valid farthest vertex found, using vertex 0" << std::endl;
+      farthest_vertex = 0;
+      first_max_distance = 0;
+    }
+    
+    std::cout << "DEBUG: First BFS - farthest vertex from 0: " << farthest_vertex 
+              << " at distance: " << first_max_distance << std::endl;
+    
+    // Second BFS: from the farthest vertex to find the true diameter
+    std::cout << "DEBUG: Running second BFS..." << std::endl;
+    vertex_frontier_t<vertex_t, void, multi_gpu, true> temp_frontier2(handle, 2);
+    if ((farthest_vertex >= graph_view.local_vertex_partition_range_first()) && 
+        (farthest_vertex < graph_view.local_vertex_partition_range_last())) {
+      // Create a temporary vector with the farthest vertex
+      rmm::device_uvector<vertex_t> temp_vertex(1, handle.get_stream());
+      thrust::fill(handle.get_thrust_policy(), temp_vertex.begin(), temp_vertex.end(), farthest_vertex);
+      temp_frontier2.bucket(0).insert(temp_vertex.begin(), temp_vertex.end());
+    }
+    
+    auto [temp_distances2, temp_sigmas2] = brandes_bfs(handle, graph_view, edge_weight_view, temp_frontier2, do_expensive_check);
+    std::cout << "DEBUG: Second BFS completed successfully" << std::endl;
+    
+    // Calculate the true diameter from the second BFS
+    std::cout << "DEBUG: Calculating true diameter..." << std::endl;
+    vertex_t diameter = transform_reduce_v(
+      handle,
+      graph_view,
+      temp_distances2.begin(),
+      [] __device__(auto, auto d) { return (d == invalid_distance) ? vertex_t{0} : d; },
+      vertex_t{0},
+      reduce_op::maximum<vertex_t>{},
+      do_expensive_check);
+    
+    std::cout << "DEBUG: Second BFS - true diameter = " << diameter << std::endl;
+  }
+  
+  // Time the entire source vertex processing loop
+  RAFT_CUDA_TRY(cudaDeviceSynchronize());
+  auto all_sources_start = std::chrono::high_resolution_clock::now();
+  
   for (size_t source_idx = 0; source_idx < num_sources; ++source_idx) {
     //
     //  BFS
@@ -778,8 +1032,19 @@ rmm::device_uvector<weight_t> betweenness_centrality(
     // FIXME:  This has an inefficiency in early iterations, as it doesn't have enough work to
     //         keep the GPUs busy.  But we can't run too many at once or we will run out of
     //         memory. Need to investigate options to improve this performance
+    
+    // Time BFS computation
+    RAFT_CUDA_TRY(cudaDeviceSynchronize());
+    auto bfs_start = std::chrono::high_resolution_clock::now();
+    
     auto [distances, sigmas] =
       brandes_bfs(handle, graph_view, edge_weight_view, vertex_frontier, do_expensive_check);
+    
+    RAFT_CUDA_TRY(cudaDeviceSynchronize());
+    auto bfs_end = std::chrono::high_resolution_clock::now();
+    auto bfs_duration = std::chrono::duration_cast<std::chrono::microseconds>(bfs_end - bfs_start);
+    std::cout << "DEBUG: BFS time: " << bfs_duration.count() << " microseconds" << std::endl;
+    
     accumulate_vertex_results(handle,
                               graph_view,
                               edge_weight_view,
@@ -789,6 +1054,12 @@ rmm::device_uvector<weight_t> betweenness_centrality(
                               include_endpoints,
                               do_expensive_check);
   }
+  
+  RAFT_CUDA_TRY(cudaDeviceSynchronize());
+  auto all_sources_end = std::chrono::high_resolution_clock::now();
+  auto all_sources_duration = std::chrono::duration_cast<std::chrono::microseconds>(all_sources_end - all_sources_start);
+  std::cout << "DEBUG: Total time for all " << num_sources << " sources: " << all_sources_duration.count() << " microseconds" << std::endl;
+  std::cout << "DEBUG: Average time per source: " << (all_sources_duration.count() / num_sources) << " microseconds" << std::endl;
 
   std::optional<weight_t> scale_nonsource{std::nullopt};
   std::optional<weight_t> scale_source{std::nullopt};
