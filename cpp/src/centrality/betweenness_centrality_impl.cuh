@@ -1160,6 +1160,10 @@ std::tuple<rmm::device_uvector<vertex_t>, rmm::device_uvector<edge_t>> concurren
   detail::scalar_fill(handle, distances.data(), distances.size(), invalid_distance);
   detail::scalar_fill(handle, sigmas.data(), sigmas.size(), edge_t{0});
   
+  // Track visited vertices for each source to prevent infinite loops
+  rmm::device_uvector<bool> visited_vertices(n_sources * local_vertex_partition_range_size, handle.get_stream());
+  thrust::fill(handle.get_thrust_policy(), visited_vertices.begin(), visited_vertices.end(), false);
+  
   // Initialize source distances and sigmas
   auto local_vertex_partition_range_first = graph_view.local_vertex_partition_range_first();
   
@@ -1167,12 +1171,14 @@ std::tuple<rmm::device_uvector<vertex_t>, rmm::device_uvector<edge_t>> concurren
                    thrust::make_zip_iterator(sources, thrust::make_counting_iterator(uint32_t{0})),
                    thrust::make_zip_iterator(sources + n_sources, thrust::make_counting_iterator(uint32_t{0}) + n_sources),
                    [distances = distances.data(), sigmas = sigmas.data(), 
+                    visited_vertices = visited_vertices.data(),
                     local_vertex_partition_range_first, local_vertex_partition_range_size] __device__(auto pair) {
                      auto source_vertex = thrust::get<0>(pair);
                      auto source_idx = thrust::get<1>(pair);
                      auto offset = source_vertex - local_vertex_partition_range_first;
                      distances[source_idx * local_vertex_partition_range_size + offset] = 0;
                      sigmas[source_idx * local_vertex_partition_range_size + offset] = 1;
+                     visited_vertices[source_idx * local_vertex_partition_range_size + offset] = true;
                    });
   
   // Concurrent multi-source BFS iteration
@@ -1222,6 +1228,7 @@ std::tuple<rmm::device_uvector<vertex_t>, rmm::device_uvector<edge_t>> concurren
     // Debug: Print frontier expansion
     std::cout << "Depth " << depth << ": expanded to " << new_frontier_size << " vertices (frontier expand: " << frontier_expand_time << " μs)" << std::endl;
     
+    auto new_vertices_discovered = vertex_t{0};  // Initialize for the case where no new frontier vertices
     if (new_frontier_size > 0) {
       auto key_conversion_start = std::chrono::high_resolution_clock::now();
       rmm::device_uvector<uint64_t> new_frontier_keys(new_frontier_size, handle.get_stream());
@@ -1261,10 +1268,17 @@ std::tuple<rmm::device_uvector<vertex_t>, rmm::device_uvector<edge_t>> concurren
       
       // Update distances and sigmas for new vertices
       auto distance_update_start = std::chrono::high_resolution_clock::now();
+      
+      // Count newly discovered vertices
+      rmm::device_uvector<vertex_t> new_vertex_count(1, handle.get_stream());
+      thrust::fill(handle.get_thrust_policy(), new_vertex_count.begin(), new_vertex_count.end(), vertex_t{0});
+      
       thrust::for_each(handle.get_thrust_policy(),
                        thrust::make_zip_iterator(new_frontier_keys.begin(), distance_buffer.begin()),
                        thrust::make_zip_iterator(new_frontier_keys.end(), distance_buffer.end()),
                        [distances = distances.data(), sigmas = sigmas.data(), 
+                        visited_vertices = visited_vertices.data(),
+                        new_vertex_count = new_vertex_count.data(),
                         local_vertex_partition_range_first, local_vertex_partition_range_size, n_sources, depth] __device__(auto pair) {
                          auto key = thrust::get<0>(pair);
                          auto new_distance = thrust::get<1>(pair);
@@ -1276,22 +1290,70 @@ std::tuple<rmm::device_uvector<vertex_t>, rmm::device_uvector<edge_t>> concurren
                          auto offset = vertex - local_vertex_partition_range_first;
                          auto array_idx = source_idx * local_vertex_partition_range_size + offset;
                          
-                         // Update distance and sigma
-                         distances[array_idx] = depth + 1;
-                         sigmas[array_idx] = 1;  // For BFS, sigma is always 1 for new vertices
-                                                });
+                         // Only update if not already visited for this source
+                         if (!visited_vertices[array_idx]) {
+                           // Update distance and sigma
+                           distances[array_idx] = depth + 1;
+                           sigmas[array_idx] = 1;  // For BFS, sigma is always 1 for new vertices
+                           
+                           // Count this as a newly discovered vertex
+                           atomicAdd(new_vertex_count, vertex_t{1});
+                         }
+                       });
+      
+      // Get the actual count of newly discovered vertices
+      std::vector<vertex_t> h_new_vertex_count(1);
+      raft::update_host(h_new_vertex_count.data(), new_vertex_count.data(), 1, handle.get_stream());
+      handle.sync_stream();
+      new_vertices_discovered = h_new_vertex_count[0];
+      
+      // Debug: Print detailed information about visited vertices
+      std::cout << "  DEBUG: Total frontier size: " << new_frontier_keys.size() << ", Actually new: " << new_vertices_discovered << std::endl;
       auto distance_update_end = std::chrono::high_resolution_clock::now();
       distance_update_time = std::chrono::duration_cast<std::chrono::microseconds>(distance_update_end - distance_update_start).count();
       
-      // Update frontier for next iteration
+      // Update frontier for next iteration - only add unvisited vertices
       auto frontier_update_start = std::chrono::high_resolution_clock::now();
       vertex_frontier.bucket(bucket_idx_cur).clear();
+      
+      // Filter out already visited vertices before adding to frontier
+      rmm::device_uvector<uint64_t> unvisited_keys(new_frontier_keys.size(), handle.get_stream());
+      auto unvisited_end = thrust::copy_if(handle.get_thrust_policy(),
+                                          new_frontier_keys.begin(),
+                                          new_frontier_keys.end(),
+                                          unvisited_keys.begin(),
+                                          [visited_vertices = visited_vertices.data(),
+                                           local_vertex_partition_range_first, local_vertex_partition_range_size, n_sources] __device__(auto key) {
+                                            auto vertex = static_cast<vertex_t>(key / static_cast<uint64_t>(n_sources));
+                                            auto source_idx = static_cast<uint32_t>(key % static_cast<uint64_t>(n_sources));
+                                            auto offset = vertex - local_vertex_partition_range_first;
+                                            auto array_idx = source_idx * local_vertex_partition_range_size + offset;
+                                            return !visited_vertices[array_idx];
+                                          });
+      unvisited_keys.resize(thrust::distance(unvisited_keys.begin(), unvisited_end), handle.get_stream());
+      
       auto new_frontier_vi_first = thrust::make_transform_iterator(
-        new_frontier_keys.begin(),
+        unvisited_keys.begin(),
         split_vi_t<vertex_t>{static_cast<uint32_t>(n_sources)});
       vertex_frontier.bucket(bucket_idx_cur).insert(
         new_frontier_vi_first,
-        new_frontier_vi_first + new_frontier_keys.size());
+        new_frontier_vi_first + unvisited_keys.size());
+      
+      // Now mark the vertices that we added to the frontier as visited
+      thrust::for_each(handle.get_thrust_policy(),
+                       unvisited_keys.begin(),
+                       unvisited_keys.end(),
+                       [visited_vertices = visited_vertices.data(),
+                        local_vertex_partition_range_first, local_vertex_partition_range_size, n_sources] __device__(auto key) {
+                         auto vertex = static_cast<vertex_t>(key / static_cast<uint64_t>(n_sources));
+                         auto source_idx = static_cast<uint32_t>(key % static_cast<uint64_t>(n_sources));
+                         auto offset = vertex - local_vertex_partition_range_first;
+                         auto array_idx = source_idx * local_vertex_partition_range_size + offset;
+                         visited_vertices[array_idx] = true;
+                       });
+      
+      // Debug: Print frontier filtering information
+      std::cout << "  DEBUG: After filtering visited vertices: " << unvisited_keys.size() << " vertices added to frontier" << std::endl;
       auto frontier_update_end = std::chrono::high_resolution_clock::now();
       frontier_update_time = std::chrono::duration_cast<std::chrono::microseconds>(frontier_update_end - frontier_update_start).count();
     } else {
@@ -1299,6 +1361,10 @@ std::tuple<rmm::device_uvector<vertex_t>, rmm::device_uvector<edge_t>> concurren
       auto frontier_update_start = std::chrono::high_resolution_clock::now();
       auto frontier_update_end = std::chrono::high_resolution_clock::now();
       frontier_update_time = std::chrono::duration_cast<std::chrono::microseconds>(frontier_update_end - frontier_update_start).count();
+      
+      // No new vertices to process, we're done
+      std::cout << "Termination: no new vertices to expand at depth " << depth << std::endl;
+      break;
     }
     
     // Clean up buffers
@@ -1313,10 +1379,17 @@ std::tuple<rmm::device_uvector<vertex_t>, rmm::device_uvector<edge_t>> concurren
     cur_frontier_size = static_cast<vertex_t>(vertex_frontier.bucket(bucket_idx_cur).aggregate_size());
     depth++;
     
+    // Check termination condition - if no new vertices discovered, we're done
+    if (new_vertices_discovered == 0) {
+      std::cout << "Termination: no new vertices discovered at depth " << depth << std::endl;
+      break;
+    }
+    
     auto iteration_end = std::chrono::high_resolution_clock::now();
     auto iteration_time = std::chrono::duration_cast<std::chrono::microseconds>(iteration_end - iteration_start).count();
     
     // Debug: Print iteration summary with timing breakdown
+    std::cout << "  New vertices discovered: " << new_vertices_discovered << std::endl;
     std::cout << "  Next frontier size: " << cur_frontier_size << std::endl;
     std::cout << "  Timing breakdown (μs): frontier_expand=" << frontier_expand_time 
               << ", key_conversion=" << key_conversion_time 
