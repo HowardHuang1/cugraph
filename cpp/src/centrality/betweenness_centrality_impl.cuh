@@ -574,7 +574,10 @@ void concurrent_accumulate_vertex_results(
     auto source_sigmas = all_sigmas.begin() + source_idx * local_vertex_partition_range_size;
     
     // Use pre-computed maximum distance
-    vertex_t max_distance = max_distances.data()[source_idx];
+    std::vector<vertex_t> h_max_distance(1);
+    raft::update_host(h_max_distance.data(), max_distances.data() + source_idx, 1, handle.get_stream());
+    handle.sync_stream();
+    vertex_t max_distance = h_max_distance[0];
     std::cout << "DEBUG: Source " << source_idx << " max distance: " << max_distance << std::endl;
     
     // Initialize delta array for this source
@@ -1344,10 +1347,34 @@ std::tuple<rmm::device_uvector<vertex_t>, rmm::device_uvector<edge_t>> concurren
                            atomicAdd(new_vertex_count, vertex_t{1});
                          }
                        });
-      
-            // Second pass: accumulate sigmas from predecessors using graph structure
+            
+      // Second pass: update distances for all newly discovered vertices (after sigma accumulation)
+      thrust::for_each(handle.get_thrust_policy(),
+                       thrust::make_zip_iterator(new_frontier_keys.begin(), distance_buffer.begin()),
+                       thrust::make_zip_iterator(new_frontier_keys.end(), distance_buffer.end()),
+                       [distances_2d = distances_2d.data(), 
+                        visited_vertices = visited_vertices.data(),
+                        local_vertex_partition_range_first, local_vertex_partition_range_size, n_sources, depth] __device__(auto pair) {
+                         auto key = thrust::get<0>(pair);
+                         auto new_distance = thrust::get<1>(pair);
+                         
+                         // Extract vertex and source index from key
+                         auto vertex = static_cast<vertex_t>(key / static_cast<uint64_t>(n_sources));
+                         auto source_idx = static_cast<uint32_t>(key % static_cast<uint64_t>(n_sources));
+                         
+                         auto offset = vertex - local_vertex_partition_range_first;
+                         auto array_idx = source_idx * local_vertex_partition_range_size + offset;
+                         
+                         // Only update if not already visited for this source
+                         if (!visited_vertices[array_idx]) {
+                           // Update distance (sigma was already accumulated)
+                           distances_2d[array_idx] = depth + 1;
+                         }
+                       });
+
+      // Third pass: accumulate sigmas from predecessors using graph structure
       // This must be sequential per source for correctness, but we optimize the implementation
-            if (new_frontier_size > 0) {
+      if (new_frontier_size > 0) {
         // Pre-compute source vertex counts in parallel
         rmm::device_uvector<vertex_t> source_vertex_counts(n_sources, handle.get_stream());
         thrust::fill(handle.get_thrust_policy(), source_vertex_counts.begin(), source_vertex_counts.end(), vertex_t{0});
@@ -1504,29 +1531,6 @@ std::tuple<rmm::device_uvector<vertex_t>, rmm::device_uvector<edge_t>> concurren
         }
       }
       
-      // Third pass: update distances for all newly discovered vertices (after sigma accumulation)
-      thrust::for_each(handle.get_thrust_policy(),
-                       thrust::make_zip_iterator(new_frontier_keys.begin(), distance_buffer.begin()),
-                       thrust::make_zip_iterator(new_frontier_keys.end(), distance_buffer.end()),
-                       [distances_2d = distances_2d.data(), 
-                        visited_vertices = visited_vertices.data(),
-                        local_vertex_partition_range_first, local_vertex_partition_range_size, n_sources, depth] __device__(auto pair) {
-                         auto key = thrust::get<0>(pair);
-                         auto new_distance = thrust::get<1>(pair);
-                         
-                         // Extract vertex and source index from key
-                         auto vertex = static_cast<vertex_t>(key / static_cast<uint64_t>(n_sources));
-                         auto source_idx = static_cast<uint32_t>(key % static_cast<uint64_t>(n_sources));
-                         
-                         auto offset = vertex - local_vertex_partition_range_first;
-                         auto array_idx = source_idx * local_vertex_partition_range_size + offset;
-                         
-                         // Only update if not already visited for this source
-                         if (!visited_vertices[array_idx]) {
-                           // Update distance (sigma was already accumulated)
-                           distances_2d[array_idx] = depth + 1;
-                         }
-                       });
       
       // Get the actual count of newly discovered vertices
       std::vector<vertex_t> h_new_vertex_count(1);
