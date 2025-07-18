@@ -70,6 +70,15 @@ struct brandes_e_op_t {
   {
     return src_sigma;
   }
+
+  // Overload for dummy property views that return nullopt
+  __device__ cuda::std::nullopt_t operator()(
+    vertex_t, vertex_t, cuda::std::nullopt_t, cuda::std::nullopt_t, cuda::std::nullopt_t) const
+  {
+    // With dummy property views, we can't access actual sigma values
+    // This should not be used in practice since we handle sigma accumulation manually
+    return cuda::std::nullopt;
+  }
 };
 
 template <typename vertex_t>
@@ -81,6 +90,15 @@ struct brandes_pred_op_t {
     vertex_t, vertex_t, value_t src_sigma, vertex_t dst_distance, ignore_t) const
   {
     return (dst_distance == invalid_distance_);
+  }
+
+  // Overload for dummy property views that return nullopt
+  __device__ bool operator()(
+    vertex_t, vertex_t, cuda::std::nullopt_t, cuda::std::nullopt_t, cuda::std::nullopt_t) const
+  {
+    // With dummy property views, we can't check dst_distance directly
+    // We'll rely on the frontier management to handle this correctly
+    return true;
   }
 };
 
@@ -134,82 +152,64 @@ struct extract_edge_pred_op_t {
   }
 };
 
-template <typename vertex_t>
-struct sigma_only_pred_op_t {
-  vertex_t current_depth;
-  vertex_t invalid_distance;
-  
-  sigma_only_pred_op_t(vertex_t depth, vertex_t invalid_dist) 
-    : current_depth(depth), invalid_distance(invalid_dist) {}
-  
-  template <typename value_t, typename ignore_t>
-  __device__ bool operator()(
-    vertex_t src, vertex_t dst, value_t src_sigma, vertex_t dst_distance, ignore_t) const
-  {
-    // Process edges where source has sigma > 0 and destination is at previous depth
-    return (src_sigma > 0) && (dst_distance == current_depth - 1);
-  }
-};
+
 
 }  // namespace
 
 namespace cugraph {
 namespace detail {
 
-// Functors for concurrent multi-source BFS
-template <typename vertex_t>
-struct concurrent_bfs_e_op_t {
-  __device__ thrust::tuple<thrust::tuple<vertex_t, uint32_t>, vertex_t> operator()(
-    thrust::tuple<vertex_t, uint32_t> tagged_src,
-    vertex_t dst,
-    cuda::std::nullopt_t,
-    cuda::std::nullopt_t,
-    cuda::std::nullopt_t) const
-  {
-    // Extract source index from tagged vertex
+// Functors for multi-source sigma accumulation
+template <typename vertex_t, typename edge_t>
+struct multi_source_brandes_e_op_t {
+  size_t n_sources;
+  size_t local_vertex_partition_range_size;
+  edge_t* sigmas_2d;
+  vertex_t* distances_2d;
+  vertex_t local_vertex_partition_range_first;
+  
+  __device__ edge_t operator()(thrust::tuple<vertex_t, uint32_t> tagged_src,
+                              vertex_t dst,
+                              cuda::std::nullopt_t,
+                              cuda::std::nullopt_t,
+                              cuda::std::nullopt_t) const {
+    auto src_vertex = thrust::get<0>(tagged_src);
     auto source_idx = thrust::get<1>(tagged_src);
-    // Return (tagged_destination, distance) where distance is computed separately
-    return thrust::make_tuple(thrust::make_tuple(dst, source_idx), dst);
+    
+    // Check if destination is unvisited for this source
+    auto dst_offset = dst - local_vertex_partition_range_first;
+    auto dst_array_idx = source_idx * local_vertex_partition_range_size + dst_offset;
+    
+    // Only contribute sigma if destination is unvisited
+    if (distances_2d[dst_array_idx] == std::numeric_limits<vertex_t>::max()) {
+      // Return the sigma value from the source vertex for this specific source
+      auto src_offset = src_vertex - local_vertex_partition_range_first;
+      auto src_array_idx = source_idx * local_vertex_partition_range_size + src_offset;
+      return sigmas_2d[src_array_idx];
+    }
+    return edge_t{0};
   }
 };
 
-template <typename vertex_t>
-struct concurrent_bfs_pred_op_t {
-  vertex_t invalid_distance;
-
-  concurrent_bfs_pred_op_t(vertex_t invalid_dist) : invalid_distance(invalid_dist) {}
-
+template <typename vertex_t, typename edge_t>
+struct multi_source_brandes_pred_op_t {
+  size_t n_sources;
+  size_t local_vertex_partition_range_size;
+  vertex_t* distances_2d;
+  vertex_t local_vertex_partition_range_first;
+  
   __device__ bool operator()(thrust::tuple<vertex_t, uint32_t> tagged_src,
-                             vertex_t dst,
-                             cuda::std::nullopt_t,
-                             cuda::std::nullopt_t,
-                             cuda::std::nullopt_t) const
-  {
-    // Always process the edge in concurrent BFS
-    // The frontier management will handle duplicates
-    return true;
-  }
-};
-
-// Helper functions for vertex-source aggregation
-template <typename vertex_t>
-struct aggregate_vi_t {
-  uint32_t num_sources{};
-  
-  __device__ uint64_t operator()(thrust::tuple<vertex_t, uint32_t> tup) const {
-    return (static_cast<uint64_t>(thrust::get<0>(tup)) * static_cast<uint64_t>(num_sources)) +
-           static_cast<uint64_t>(thrust::get<1>(tup));
-  }
-};
-
-template <typename vertex_t>
-struct split_vi_t {
-  uint32_t num_sources{};
-  
-  __device__ thrust::tuple<vertex_t, uint32_t> operator()(uint64_t aggregated_vi) const {
-    return thrust::make_tuple(
-      static_cast<vertex_t>(aggregated_vi / static_cast<uint64_t>(num_sources)),
-      static_cast<uint32_t>(aggregated_vi % static_cast<uint64_t>(num_sources)));
+                            vertex_t dst,
+                            cuda::std::nullopt_t,
+                            cuda::std::nullopt_t,
+                            cuda::std::nullopt_t) const {
+    auto source_idx = thrust::get<1>(tagged_src);
+    
+    // Check if destination is unvisited for this specific source
+    auto dst_offset = dst - local_vertex_partition_range_first;
+    auto dst_array_idx = source_idx * local_vertex_partition_range_size + dst_offset;
+    
+    return (distances_2d[dst_array_idx] == std::numeric_limits<vertex_t>::max());
   }
 };
 
@@ -1138,7 +1138,7 @@ void concurrent_betweenness_centrality_impl(
   detail::scalar_fill(handle, centralities.data(), centralities.size(), weight_t{0});
   
   // Run concurrent multi-source BFS for all sources
-  auto [all_distances, all_sigmas] = concurrent_brandes_bfs(
+  auto [all_distances, all_sigmas] = multi_source_brandes_bfs(
     handle, graph_view, edge_weight_view, sources, n_sources, do_expensive_check);
   
   // Use concurrent accumulate function for multi-source data
@@ -1161,7 +1161,7 @@ void concurrent_betweenness_centrality_impl(
 }
 
 template <typename vertex_t, typename edge_t, typename weight_t, bool multi_gpu>
-std::tuple<rmm::device_uvector<vertex_t>, rmm::device_uvector<edge_t>> concurrent_brandes_bfs(
+std::tuple<rmm::device_uvector<vertex_t>, rmm::device_uvector<edge_t>> multi_source_brandes_bfs(
   raft::handle_t const& handle,
   graph_view_t<vertex_t, edge_t, false, multi_gpu> const& graph_view,
   std::optional<edge_property_view_t<edge_t, weight_t const*>> edge_weight_view,
@@ -1171,7 +1171,7 @@ std::tuple<rmm::device_uvector<vertex_t>, rmm::device_uvector<edge_t>> concurren
 {
   constexpr vertex_t invalid_distance = std::numeric_limits<vertex_t>::max();
   constexpr size_t bucket_idx_cur = 0;
-  constexpr size_t num_buckets = 1;  // Only need 1 bucket for concurrent BFS
+  constexpr size_t num_buckets = 1;
   
   // Initialize frontier with tagged sources: (vertex, source_index) pairs
   vertex_frontier_t<vertex_t, uint32_t, multi_gpu, true> vertex_frontier(handle, num_buckets);
@@ -1198,10 +1198,6 @@ std::tuple<rmm::device_uvector<vertex_t>, rmm::device_uvector<edge_t>> concurren
   detail::scalar_fill(handle, distances_2d.data(), distances_2d.size(), invalid_distance);
   detail::scalar_fill(handle, sigmas_2d.data(), sigmas_2d.size(), edge_t{0});
   
-  // Track visited vertices for each source to prevent infinite loops
-  rmm::device_uvector<bool> visited_vertices(n_sources * local_vertex_partition_range_size, handle.get_stream());
-  thrust::fill(handle.get_thrust_policy(), visited_vertices.begin(), visited_vertices.end(), false);
-  
   // Initialize source distances and sigmas
   auto local_vertex_partition_range_first = graph_view.local_vertex_partition_range_first();
   
@@ -1210,14 +1206,12 @@ std::tuple<rmm::device_uvector<vertex_t>, rmm::device_uvector<edge_t>> concurren
                    thrust::make_zip_iterator(sources, thrust::make_counting_iterator(uint32_t{0})),
                    thrust::make_zip_iterator(sources + n_sources, thrust::make_counting_iterator(uint32_t{0}) + n_sources),
                    [distances_2d = distances_2d.data(), sigmas_2d = sigmas_2d.data(), 
-                    visited_vertices = visited_vertices.data(),
                     local_vertex_partition_range_first, local_vertex_partition_range_size] __device__(auto pair) {
                      auto source_vertex = thrust::get<0>(pair);
                      auto source_idx = thrust::get<1>(pair);
                      auto offset = source_vertex - local_vertex_partition_range_first;
                      distances_2d[source_idx * local_vertex_partition_range_size + offset] = 0;
                      sigmas_2d[source_idx * local_vertex_partition_range_size + offset] = 1;
-                     visited_vertices[source_idx * local_vertex_partition_range_size + offset] = true;
                    });
   
   // Print initial source information
@@ -1228,430 +1222,96 @@ std::tuple<rmm::device_uvector<vertex_t>, rmm::device_uvector<edge_t>> concurren
     std::cout << "  Source " << i << ": vertex " << h_sources[i] << " (distance=0, sigma=1)" << std::endl;
   }
   
-  // Concurrent multi-source BFS iteration
+  // Multi-source BFS iteration
   vertex_t depth{0};
   auto cur_frontier_size = static_cast<vertex_t>(vertex_frontier.bucket(bucket_idx_cur).aggregate_size());
   
-  // Debug: Print initial frontier size
-  std::cout << "Starting concurrent BFS with " << n_sources << " sources, initial frontier size: " << cur_frontier_size << std::endl;
-  
-  // Memory tracking
-  size_t total_memory_allocated = 0;
-  size_t peak_memory_usage = 0;
+  std::cout << "Starting multi-source BFS with " << n_sources << " sources, initial frontier size: " << cur_frontier_size << std::endl;
   
   while (cur_frontier_size > 0) {
-    auto iteration_start = std::chrono::high_resolution_clock::now();
+    // Use the primitive with tagged vertices to expand the frontier
+    auto [new_frontier_tagged_vertices, new_sigmas] = cugraph::transform_reduce_if_v_frontier_outgoing_e_by_dst(
+      handle,
+      graph_view,
+      vertex_frontier.bucket(bucket_idx_cur),
+      edge_src_dummy_property_t{}.view(),
+      edge_dst_dummy_property_t{}.view(),
+      edge_dummy_property_t{}.view(),
+      multi_source_brandes_e_op_t<vertex_t, edge_t>{
+        n_sources,
+        static_cast<size_t>(local_vertex_partition_range_size),
+        sigmas_2d.data(),
+        distances_2d.data(),
+        local_vertex_partition_range_first
+      },
+      reduce_op::plus<edge_t>(),
+      multi_source_brandes_pred_op_t<vertex_t, edge_t>{
+        n_sources,
+        static_cast<size_t>(local_vertex_partition_range_size),
+        distances_2d.data(),
+        local_vertex_partition_range_first
+      });
     
-    // Initialize timing variables
-    auto key_conversion_time = 0;
-    auto sort_reduce_time = 0;
-    auto distance_update_time = 0;
-    auto frontier_update_time = 0;
+    auto new_frontier_size = size_dataframe_buffer(new_frontier_tagged_vertices);
     
-    // Process current frontier - expand to neighbors for each source concurrently
-    auto frontier_expand_start = std::chrono::high_resolution_clock::now();
-    auto new_frontier_tagged_vertex_buffer =
-      allocate_dataframe_buffer<thrust::tuple<vertex_t, uint32_t>>(0, handle.get_stream());
-    rmm::device_uvector<vertex_t> distance_buffer(0, handle.get_stream());
+    std::cout << "Depth " << depth << ": expanded to " << new_frontier_size << " vertices" << std::endl;
     
-    std::tie(new_frontier_tagged_vertex_buffer, distance_buffer) = detail::
-      extract_transform_if_v_frontier_e<false, thrust::tuple<vertex_t, uint32_t>, vertex_t>(
-        handle,
-        graph_view,
-        vertex_frontier.bucket(bucket_idx_cur),
-        edge_src_dummy_property_t{}.view(),
-        edge_dst_dummy_property_t{}.view(),
-        edge_dummy_property_t{}.view(),
-        concurrent_bfs_e_op_t<vertex_t>{},
-        concurrent_bfs_pred_op_t<vertex_t>{invalid_distance},
-        do_expensive_check);
-    
-    auto frontier_expand_end = std::chrono::high_resolution_clock::now();
-    auto frontier_expand_time = std::chrono::duration_cast<std::chrono::microseconds>(frontier_expand_end - frontier_expand_start).count();
-    
-    // Convert to keys and sort/reduce to handle duplicates
-    auto new_frontier_size = size_dataframe_buffer(new_frontier_tagged_vertex_buffer);
-    
-    // Debug: Print frontier expansion
-    std::cout << "Depth " << depth << ": expanded to " << new_frontier_size << " vertices (frontier expand: " << frontier_expand_time << " μs)" << std::endl;
-    
-    auto new_vertices_discovered = vertex_t{0};  // Initialize for the case where no new frontier vertices
     if (new_frontier_size > 0) {
-      auto key_conversion_start = std::chrono::high_resolution_clock::now();
-      rmm::device_uvector<uint64_t> new_frontier_keys(new_frontier_size, handle.get_stream());
+      // Handle potential duplicates by sorting and reducing
+      auto [unique_frontier, unique_sigmas] = detail::sort_and_reduce_buffer_elements<
+        thrust::tuple<vertex_t, uint32_t>, thrust::tuple<vertex_t, uint32_t>, edge_t, reduce_op::plus<edge_t>>(
+        handle,
+        std::move(new_frontier_tagged_vertices),
+        std::move(new_sigmas),
+        reduce_op::plus<edge_t>(),
+        std::make_tuple(vertex_t{0}, graph_view.number_of_vertices()),
+        std::nullopt);
       
-      // Track memory allocation
-      size_t keys_memory = new_frontier_keys.size() * sizeof(uint64_t);
-      total_memory_allocated += keys_memory;
-      peak_memory_usage = std::max(peak_memory_usage, total_memory_allocated);
+      auto unique_frontier_size = size_dataframe_buffer(unique_frontier);
+      std::cout << "  After deduplication: " << new_frontier_size << " -> " << unique_frontier_size << " vertices" << std::endl;
       
-      auto key_first = thrust::make_transform_iterator(
-        get_dataframe_buffer_begin(new_frontier_tagged_vertex_buffer),
-        aggregate_vi_t<vertex_t>{static_cast<uint32_t>(n_sources)});
-      thrust::copy(handle.get_thrust_policy(),
-                   key_first,
-                   key_first + new_frontier_size,
-                   new_frontier_keys.begin());
-      
-      auto key_conversion_end = std::chrono::high_resolution_clock::now();
-      key_conversion_time = std::chrono::duration_cast<std::chrono::microseconds>(key_conversion_end - key_conversion_start).count();
-      
-      // Sort and reduce to handle duplicates - keep minimum distance for each vertex-source pair
-      auto sort_reduce_start = std::chrono::high_resolution_clock::now();
-      auto before_reduce_size = new_frontier_keys.size();
-      std::tie(new_frontier_keys, distance_buffer) =
-        detail::sort_and_reduce_buffer_elements<uint64_t, uint64_t, vertex_t, reduce_op::minimum<vertex_t>>(
-          handle,
-          std::move(new_frontier_keys),
-          std::move(distance_buffer),
-          reduce_op::minimum<vertex_t>(),
-          std::make_tuple(vertex_t{0}, graph_view.number_of_vertices()),
-          std::nullopt);
-      auto sort_reduce_end = std::chrono::high_resolution_clock::now();
-      sort_reduce_time = std::chrono::duration_cast<std::chrono::microseconds>(sort_reduce_end - sort_reduce_start).count();
-      
-      // Debug: Print reduction results
-      std::cout << "  After reduction: " << before_reduce_size << " -> " << new_frontier_keys.size() << " vertices (sort/reduce: " << sort_reduce_time << " μs)" << std::endl;
-      
-      // Update distances and sigmas for new vertices
-      auto distance_update_start = std::chrono::high_resolution_clock::now();
-      
-      // Count newly discovered vertices
-      rmm::device_uvector<vertex_t> new_vertex_count(1, handle.get_stream());
-      thrust::fill(handle.get_thrust_policy(), new_vertex_count.begin(), new_vertex_count.end(), vertex_t{0});
-      
-      // First pass: count newly discovered vertices and mark them as discovered (but don't update distances yet)
-      thrust::for_each(handle.get_thrust_policy(),
-                       thrust::make_zip_iterator(new_frontier_keys.begin(), distance_buffer.begin()),
-                       thrust::make_zip_iterator(new_frontier_keys.end(), distance_buffer.end()),
-                       [distances_2d = distances_2d.data(), sigmas_2d = sigmas_2d.data(), 
-                        visited_vertices = visited_vertices.data(),
-                        new_vertex_count = new_vertex_count.data(),
-                        local_vertex_partition_range_first, local_vertex_partition_range_size, n_sources, depth] __device__(auto pair) {
-                         auto key = thrust::get<0>(pair);
-                         auto new_distance = thrust::get<1>(pair);
-                         
-                         // Extract vertex and source index from key
-                         auto vertex = static_cast<vertex_t>(key / static_cast<uint64_t>(n_sources));
-                         auto source_idx = static_cast<uint32_t>(key % static_cast<uint64_t>(n_sources));
-                         
-                         auto offset = vertex - local_vertex_partition_range_first;
-                         auto array_idx = source_idx * local_vertex_partition_range_size + offset;
-                         
-                         // Only process if not already visited for this source
-                         if (!visited_vertices[array_idx]) {
-                           // Initialize sigma to 0 (will be accumulated before updating distance)
-                           sigmas_2d[array_idx] = 0;
-                           
-                           // Count this as a newly discovered vertex
-                           atomicAdd(new_vertex_count, vertex_t{1});
-                         }
-                       });
-            
-      // Second pass: update distances for all newly discovered vertices (after sigma accumulation)
-      thrust::for_each(handle.get_thrust_policy(),
-                       thrust::make_zip_iterator(new_frontier_keys.begin(), distance_buffer.begin()),
-                       thrust::make_zip_iterator(new_frontier_keys.end(), distance_buffer.end()),
-                       [distances_2d = distances_2d.data(), 
-                        visited_vertices = visited_vertices.data(),
-                        local_vertex_partition_range_first, local_vertex_partition_range_size, n_sources, depth] __device__(auto pair) {
-                         auto key = thrust::get<0>(pair);
-                         auto new_distance = thrust::get<1>(pair);
-                         
-                         // Extract vertex and source index from key
-                         auto vertex = static_cast<vertex_t>(key / static_cast<uint64_t>(n_sources));
-                         auto source_idx = static_cast<uint32_t>(key % static_cast<uint64_t>(n_sources));
-                         
-                         auto offset = vertex - local_vertex_partition_range_first;
-                         auto array_idx = source_idx * local_vertex_partition_range_size + offset;
-                         
-                         // Only update if not already visited for this source
-                         if (!visited_vertices[array_idx]) {
-                           // Update distance (sigma was already accumulated)
-                           distances_2d[array_idx] = depth + 1;
-                         }
-                       });
-
-      // Third pass: accumulate sigmas from predecessors using graph structure
-      // This must be sequential per source for correctness, but we optimize the implementation
-      if (new_frontier_size > 0) {
-        // Pre-compute source vertex counts in parallel
-        rmm::device_uvector<vertex_t> source_vertex_counts(n_sources, handle.get_stream());
-        thrust::fill(handle.get_thrust_policy(), source_vertex_counts.begin(), source_vertex_counts.end(), vertex_t{0});
-        
-        thrust::for_each(handle.get_thrust_policy(),
-                         get_dataframe_buffer_begin(new_frontier_tagged_vertex_buffer),
-                         get_dataframe_buffer_end(new_frontier_tagged_vertex_buffer),
-                         [source_vertex_counts = source_vertex_counts.data()] __device__(auto tagged_pair) {
-                           auto source_idx = thrust::get<1>(tagged_pair);
-                           atomicAdd(&source_vertex_counts[source_idx], vertex_t{1});
-                         });
-        
-        // Sequential sigma accumulation per source (this is the bottleneck, but necessary for correctness)
-        std::cout << "  DEBUG: Starting sigma accumulation for " << n_sources << " sources" << std::endl;
-        
-        // Copy source vertex counts to host for sequential processing
-        std::vector<vertex_t> h_source_vertex_counts(n_sources);
-        raft::update_host(h_source_vertex_counts.data(), source_vertex_counts.data(), n_sources, handle.get_stream());
-        handle.sync_stream();
-        
-        for (uint32_t source_idx = 0; source_idx < n_sources; ++source_idx) {
-          auto source_vertex_count = h_source_vertex_counts[source_idx];
+      // Update distances and sigmas for newly discovered vertices
+      thrust::for_each(
+        handle.get_thrust_policy(),
+        thrust::make_zip_iterator(get_dataframe_buffer_begin(unique_frontier), get_dataframe_buffer_begin(unique_sigmas)),
+        thrust::make_zip_iterator(get_dataframe_buffer_end(unique_frontier), get_dataframe_buffer_end(unique_sigmas)),
+        [distances_2d = distances_2d.data(), sigmas_2d = sigmas_2d.data(),
+         local_vertex_partition_range_first, local_vertex_partition_range_size, depth, n_sources] __device__(auto pair) {
+          auto tagged_vertex = thrust::get<0>(pair);
+          auto sigma = thrust::get<1>(pair);
           
-          std::cout << "    Source " << source_idx << ": processing " << source_vertex_count << " vertices" << std::endl;
+          auto vertex = thrust::get<0>(tagged_vertex);
+          auto source_idx = thrust::get<1>(tagged_vertex);
+          auto offset = vertex - local_vertex_partition_range_first;
+          auto array_idx = source_idx * local_vertex_partition_range_size + offset;
           
-          if (source_vertex_count > 0) {
-            // Create a frontier for this specific source
-            rmm::device_uvector<thrust::tuple<vertex_t, uint32_t>> source_frontier(source_vertex_count, handle.get_stream());
-            
-            // Extract vertices for this source from the current frontier (parallel operation)
-            thrust::copy_if(handle.get_thrust_policy(),
-                           get_dataframe_buffer_begin(new_frontier_tagged_vertex_buffer),
-                           get_dataframe_buffer_end(new_frontier_tagged_vertex_buffer),
-                           source_frontier.begin(),
-                           [source_idx] __device__(auto tagged_pair) {
-                             return thrust::get<1>(tagged_pair) == source_idx;
-                           });
-            
-            // Create a vertex frontier for this source
-            vertex_frontier_t<vertex_t, void, multi_gpu, true> source_vertex_frontier(handle, 1);
-            
-            // Extract just the vertices for the frontier
-            rmm::device_uvector<vertex_t> source_vertices(source_vertex_count, handle.get_stream());
-            thrust::transform(handle.get_thrust_policy(),
-                            source_frontier.begin(),
-                            source_frontier.end(),
-                            source_vertices.begin(),
-                            [] __device__(auto pair) { return thrust::get<0>(pair); });
-            
-            source_vertex_frontier.bucket(0).insert(source_vertices.begin(), source_vertices.end());
-            
-            // === 1D EXTRACTION FROM 2D ARRAYS ===
-            // Extract 1D views for this specific source's data from the 2D arrays
-            auto source_1d_sigmas_begin = sigmas_2d.begin() + source_idx * local_vertex_partition_range_size;
-            auto source_1d_distances_begin = distances_2d.begin() + source_idx * local_vertex_partition_range_size;
-            
-            // Create edge property views for this source (expects 1D arrays)
-            edge_src_property_t<vertex_t, edge_t> src_sigmas_1d(handle, graph_view);
-            edge_dst_property_t<vertex_t, vertex_t> dst_distances_1d(handle, graph_view);
-            
-            // Update edge properties with this source's 1D sigma and distance values
-            update_edge_src_property(handle, graph_view, source_1d_sigmas_begin, src_sigmas_1d.mutable_view());
-            update_edge_dst_property(handle, graph_view, source_1d_distances_begin, dst_distances_1d.mutable_view());
-            
-            // Debug: Check what values are in the edge property views
-            std::cout << "        DEBUG: Edge property views for source " << source_idx << ":" << std::endl;
-            std::cout << "          Source sigmas: using 1D array starting at offset " << (source_idx * local_vertex_partition_range_size) << std::endl;
-            std::cout << "          Destination distances: using 1D array starting at offset " << (source_idx * local_vertex_partition_range_size) << std::endl;
-            std::cout << "          Note: distances not updated yet, so most are invalid_distance" << std::endl;
-            
-            // === 1D SIGMA ACCUMULATION ===
-            // Use a sigma-only accumulation approach to avoid duplicate frontier expansion
-            // We already expanded the frontier in Phase 1, now we just need to accumulate sigmas
-            std::cout << "      Computing sigma accumulation for source " << source_idx << "..." << std::endl;
-            
-            // For sigma accumulation, we need to find edges where:
-            // - source is at current depth (has sigma > 0) 
-            // - destination is at previous depth (has valid distance)
-            // This accumulates sigmas from predecessors without expanding the frontier again
-            
-            auto [new_sigma_frontier_1d, new_sigma_values_1d] = cugraph::transform_reduce_if_v_frontier_outgoing_e_by_dst(
-              handle,
-              graph_view,
-              source_vertex_frontier.bucket(0),
-              src_sigmas_1d.view(),
-              dst_distances_1d.view(),
-              cugraph::edge_dummy_property_t{}.view(),
-              brandes_e_op_t<vertex_t>{},
-              reduce_op::plus<vertex_t>(),
-              sigma_only_pred_op_t{depth + 1, invalid_distance});
-            
-            std::cout << "      Sigma accumulation result: " << new_sigma_frontier_1d.size() << " vertices with updated sigmas" << std::endl;
-            
-            // === COMBINE 1D RESULTS BACK INTO 2D ARRAY ===
-            // Update sigmas for vertices discovered by this source (parallel operation)
-            if (new_sigma_frontier_1d.size() > 0) {
-              // Track sigma updates for debugging
-              rmm::device_uvector<vertex_t> updated_vertices(new_sigma_frontier_1d.size(), handle.get_stream());
-              rmm::device_uvector<edge_t> old_sigma_values(new_sigma_frontier_1d.size(), handle.get_stream());
-              rmm::device_uvector<edge_t> new_sigma_values_copy(new_sigma_frontier_1d.size(), handle.get_stream());
-              
-              // Copy new sigma values for debugging (these are the "after" values)
-              thrust::copy(handle.get_thrust_policy(), new_sigma_values_1d.begin(), new_sigma_values_1d.end(), new_sigma_values_copy.begin());
-               
-               thrust::for_each(handle.get_thrust_policy(),
-                                thrust::make_counting_iterator(size_t{0}),
-                                thrust::make_counting_iterator(new_sigma_frontier_1d.size()),
-                                [sigmas_2d = sigmas_2d.data(),
-                                 visited_vertices = visited_vertices.data(),
-                                 updated_vertices = updated_vertices.data(),
-                                 old_sigma_values = old_sigma_values.data(),
-                                 new_sigma_frontier_1d = new_sigma_frontier_1d.data(),
-                                 new_sigma_values_1d = new_sigma_values_1d.data(),
-                                 local_vertex_partition_range_first, local_vertex_partition_range_size, n_sources, source_idx] __device__(size_t idx) {
-                                 auto vertex = new_sigma_frontier_1d[idx];
-                                 auto accumulated_sigma_1d = new_sigma_values_1d[idx];
-                                 
-                                 auto offset = vertex - local_vertex_partition_range_first;
-                                 auto array_idx_2d = source_idx * local_vertex_partition_range_size + offset;
-                                 
-                                 // Only update if this vertex was discovered at the current depth for this source
-                                 if (visited_vertices[array_idx_2d]) {
-                                   // Store old value for debugging
-                                   updated_vertices[idx] = vertex;
-                                   old_sigma_values[idx] = sigmas_2d[array_idx_2d];
-                                   
-                                   // === COMBINE: Write 1D result back into 2D array ===
-                                   sigmas_2d[array_idx_2d] = accumulated_sigma_1d;
-                                 }
-                               });
-               
-               // Print sigma updates (first few for brevity)
-               if (new_sigma_frontier_1d.size() > 0) {
-                 std::vector<vertex_t> h_updated_vertices(std::min(size_t{5}, new_sigma_frontier_1d.size()));
-                 std::vector<edge_t> h_old_sigmas(std::min(size_t{5}, new_sigma_frontier_1d.size()));
-                 std::vector<edge_t> h_new_sigmas(std::min(size_t{5}, new_sigma_frontier_1d.size()));
-                 
-                 raft::update_host(h_updated_vertices.data(), updated_vertices.data(), h_updated_vertices.size(), handle.get_stream());
-                 raft::update_host(h_old_sigmas.data(), old_sigma_values.data(), h_old_sigmas.size(), handle.get_stream());
-                 raft::update_host(h_new_sigmas.data(), new_sigma_values_copy.data(), h_new_sigmas.size(), handle.get_stream());
-                 
-                 std::cout << "      Sigma updates for source " << source_idx << " (showing first " << h_updated_vertices.size() << "):" << std::endl;
-                 for (size_t i = 0; i < h_updated_vertices.size(); ++i) {
-                   std::cout << "        Vertex " << h_updated_vertices[i] << ": sigma " << h_old_sigmas[i] << " -> " << h_new_sigmas[i] << std::endl;
-                 }
-                 if (new_sigma_frontier_1d.size() > 5) {
-                   std::cout << "        ... and " << (new_sigma_frontier_1d.size() - 5) << " more vertices" << std::endl;
-                 }
-               }
-             } else {
-               std::cout << "      No sigma updates for source " << source_idx << std::endl;
-             }
+          // Update distance and sigma for this specific source if not already visited
+          if (distances_2d[array_idx] == std::numeric_limits<vertex_t>::max()) {
+            distances_2d[array_idx] = depth + 1;
+            sigmas_2d[array_idx] = sigma;
           }
-        }
-      }
+        });
       
-      
-      // Get the actual count of newly discovered vertices
-      std::vector<vertex_t> h_new_vertex_count(1);
-      raft::update_host(h_new_vertex_count.data(), new_vertex_count.data(), 1, handle.get_stream());
-      handle.sync_stream();
-      new_vertices_discovered = h_new_vertex_count[0];
-      
-      // Debug: Print detailed information about visited vertices and parallelization
-      std::cout << "  DEBUG: Total frontier size: " << new_frontier_keys.size() << ", Actually new: " << new_vertices_discovered << std::endl;
-      std::cout << "  DEBUG: Parallel operations: distance_update=" << (new_frontier_keys.size() > 0 ? "YES" : "NO") 
-                << ", sigma_counting=" << (new_frontier_size > 0 ? "YES" : "NO") 
-                << ", sigma_accumulation=SEQUENTIAL" << std::endl;
-      auto distance_update_end = std::chrono::high_resolution_clock::now();
-      distance_update_time = std::chrono::duration_cast<std::chrono::microseconds>(distance_update_end - distance_update_start).count();
-      
-      // Update frontier for next iteration - only add unvisited vertices
-      auto frontier_update_start = std::chrono::high_resolution_clock::now();
+      // Update frontier for next iteration
       vertex_frontier.bucket(bucket_idx_cur).clear();
-      
-      // Filter out already visited vertices before adding to frontier
-      rmm::device_uvector<uint64_t> unvisited_keys(new_frontier_keys.size(), handle.get_stream());
-      auto unvisited_end = thrust::copy_if(handle.get_thrust_policy(),
-                                          new_frontier_keys.begin(),
-                                          new_frontier_keys.end(),
-                                          unvisited_keys.begin(),
-                                          [visited_vertices = visited_vertices.data(),
-                                           local_vertex_partition_range_first, local_vertex_partition_range_size, n_sources] __device__(auto key) {
-                                            auto vertex = static_cast<vertex_t>(key / static_cast<uint64_t>(n_sources));
-                                            auto source_idx = static_cast<uint32_t>(key % static_cast<uint64_t>(n_sources));
-                                            auto offset = vertex - local_vertex_partition_range_first;
-                                            auto array_idx = source_idx * local_vertex_partition_range_size + offset;
-                                            return !visited_vertices[array_idx];
-                                          });
-      unvisited_keys.resize(thrust::distance(unvisited_keys.begin(), unvisited_end), handle.get_stream());
-      
-      auto new_frontier_vi_first = thrust::make_transform_iterator(
-        unvisited_keys.begin(),
-        split_vi_t<vertex_t>{static_cast<uint32_t>(n_sources)});
       vertex_frontier.bucket(bucket_idx_cur).insert(
-        new_frontier_vi_first,
-        new_frontier_vi_first + unvisited_keys.size());
-      
-      // Now mark the vertices that we added to the frontier as visited
-      thrust::for_each(handle.get_thrust_policy(),
-                       unvisited_keys.begin(),
-                       unvisited_keys.end(),
-                       [visited_vertices = visited_vertices.data(),
-                        local_vertex_partition_range_first, local_vertex_partition_range_size, n_sources] __device__(auto key) {
-                         auto vertex = static_cast<vertex_t>(key / static_cast<uint64_t>(n_sources));
-                         auto source_idx = static_cast<uint32_t>(key % static_cast<uint64_t>(n_sources));
-                         auto offset = vertex - local_vertex_partition_range_first;
-                         auto array_idx = source_idx * local_vertex_partition_range_size + offset;
-                         visited_vertices[array_idx] = true;
-                       });
-      
-      // Debug: Print frontier filtering information
-      std::cout << "  DEBUG: After filtering visited vertices: " << unvisited_keys.size() << " vertices added to frontier" << std::endl;
-      auto frontier_update_end = std::chrono::high_resolution_clock::now();
-      frontier_update_time = std::chrono::duration_cast<std::chrono::microseconds>(frontier_update_end - frontier_update_start).count();
+        get_dataframe_buffer_begin(unique_frontier),
+        get_dataframe_buffer_end(unique_frontier));
     } else {
       vertex_frontier.bucket(bucket_idx_cur).clear();
-      auto frontier_update_start = std::chrono::high_resolution_clock::now();
-      auto frontier_update_end = std::chrono::high_resolution_clock::now();
-      frontier_update_time = std::chrono::duration_cast<std::chrono::microseconds>(frontier_update_end - frontier_update_start).count();
-      
-      // No new vertices to process, we're done
       std::cout << "Termination: no new vertices to expand at depth " << depth << std::endl;
       break;
     }
     
-    // Clean up buffers
-    auto cleanup_start = std::chrono::high_resolution_clock::now();
-    resize_dataframe_buffer(new_frontier_tagged_vertex_buffer, 0, handle.get_stream());
-    shrink_to_fit_dataframe_buffer(new_frontier_tagged_vertex_buffer, handle.get_stream());
-    distance_buffer.resize(0, handle.get_stream());
-    distance_buffer.shrink_to_fit(handle.get_stream());
-    auto cleanup_end = std::chrono::high_resolution_clock::now();
-    auto cleanup_time = std::chrono::duration_cast<std::chrono::microseconds>(cleanup_end - cleanup_start).count();
-    
     cur_frontier_size = static_cast<vertex_t>(vertex_frontier.bucket(bucket_idx_cur).aggregate_size());
     depth++;
     
-    // Check termination condition - if no new vertices discovered, we're done
-    if (new_vertices_discovered == 0) {
-      std::cout << "Termination: no new vertices discovered at depth " << depth << std::endl;
-      break;
-    }
-    
-    auto iteration_end = std::chrono::high_resolution_clock::now();
-    auto iteration_time = std::chrono::duration_cast<std::chrono::microseconds>(iteration_end - iteration_start).count();
-    
-    // Debug: Print iteration summary with timing breakdown
-    std::cout << "  New vertices discovered: " << new_vertices_discovered << std::endl;
     std::cout << "  Next frontier size: " << cur_frontier_size << std::endl;
-    std::cout << "  Timing breakdown (μs): frontier_expand=" << frontier_expand_time 
-              << ", key_conversion=" << key_conversion_time 
-              << ", sort_reduce=" << sort_reduce_time 
-              << ", distance_update=" << distance_update_time 
-              << ", frontier_update=" << frontier_update_time 
-              << ", cleanup=" << cleanup_time 
-              << ", total=" << iteration_time << std::endl;
-    std::cout << "  Memory usage: total_allocated=" << (total_memory_allocated / 1024 / 1024) << " MB, peak=" << (peak_memory_usage / 1024 / 1024) << " MB" << std::endl;
-    
-    // Debug: Show sigma statistics for this iteration
-    if (new_vertices_discovered > 0) {
-      std::cout << "  Sigma statistics for depth " << (depth - 1) << ":" << std::endl;
-      for (uint32_t source_idx = 0; source_idx < n_sources; ++source_idx) {
-        auto source_sigmas = sigmas_2d.begin() + source_idx * local_vertex_partition_range_size;
-        auto non_zero_sigmas = thrust::count_if(handle.get_thrust_policy(),
-                                               source_sigmas,
-                                               source_sigmas + local_vertex_partition_range_size,
-                                               [] __device__(auto sigma) { return sigma > 0; });
-        std::cout << "    Source " << source_idx << ": " << non_zero_sigmas << " vertices with sigma > 0" << std::endl;
-      }
-    }
     
     if (depth >= std::numeric_limits<vertex_t>::max()) { break; }
   }
   
-  std::cout << "Concurrent BFS completed in " << depth << " iterations" << std::endl;
-  std::cout << "Final memory usage: total_allocated=" << (total_memory_allocated / 1024 / 1024) << " MB, peak=" << (peak_memory_usage / 1024 / 1024) << " MB" << std::endl;
+  std::cout << "Multi-source BFS completed in " << depth << " iterations" << std::endl;
   
   return std::make_tuple(std::move(distances_2d), std::move(sigmas_2d));
 }
