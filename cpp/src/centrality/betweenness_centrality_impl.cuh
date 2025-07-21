@@ -240,13 +240,13 @@
    constexpr vertex_t invalid_distance = std::numeric_limits<vertex_t>::max();
    size_t num_sources = sources.size();
    size_t num_vertices = graph_view.number_of_vertices();
- 
+
    // Flattened 2D arrays: [vertex * num_sources + src_idx]
    rmm::device_uvector<vertex_t> distances(num_vertices * num_sources, handle.get_stream());
    rmm::device_uvector<edge_t> sigmas(num_vertices * num_sources, handle.get_stream());
    thrust::fill(handle.get_thrust_policy(), distances.begin(), distances.end(), invalid_distance);
    thrust::fill(handle.get_thrust_policy(), sigmas.begin(), sigmas.end(), 0);
- 
+
    // Initialize frontier with all sources tagged by their index
    using tagged_vertex_t = thrust::tuple<vertex_t, source_idx_t>;
    rmm::device_uvector<tagged_vertex_t> current_frontier(num_sources, handle.get_stream());
@@ -256,7 +256,7 @@
      [sources_ptr = sources.data()] __device__ (size_t i) {
        return thrust::make_tuple(sources_ptr[i], static_cast<source_idx_t>(i));
      });
- 
+
    // Set initial distances and sigmas for sources
    thrust::for_each_n(handle.get_thrust_policy(),
      thrust::make_counting_iterator<size_t>(0), num_sources,
@@ -265,13 +265,13 @@
        distances_ptr[v * num_sources + i] = 0;
        sigmas_ptr[v * num_sources + i] = 1;
      });
- 
+
    rmm::device_uvector<tagged_vertex_t> next_frontier(0, handle.get_stream());
- 
+
    // Fix: Add required argument (0) to local_edge_partition_view
    auto offsets = graph_view.local_edge_partition_view(0).offsets();
    auto indices = graph_view.local_edge_partition_view(0).indices();
- 
+
    while (current_frontier.size() > 0) {
      // --- First pass: count total number of possible new entries ---
      rmm::device_uvector<unsigned int> neighbor_counts(current_frontier.size(), handle.get_stream());
@@ -284,51 +284,51 @@
          return static_cast<unsigned int>(offsets[u + 1] - offsets[u]);
        });
      unsigned int max_next_size = thrust::reduce(handle.get_thrust_policy(), neighbor_counts.begin(), neighbor_counts.end());
- 
+
      // --- Second pass: allocate and fill next_frontier ---
      next_frontier.resize(max_next_size, handle.get_stream());
      rmm::device_uvector<unsigned int> next_count(1, handle.get_stream());
      thrust::fill(handle.get_thrust_policy(), next_count.begin(), next_count.end(), 0);
- 
+
      thrust::for_each_n(handle.get_thrust_policy(),
        thrust::make_counting_iterator<size_t>(0), current_frontier.size(),
        [current_frontier_ptr = current_frontier.data(), offsets = offsets.data(), indices = indices.data(),
         distances_ptr = distances.data(), sigmas_ptr = sigmas.data(), num_sources, next_frontier_ptr = next_frontier.data(), next_count_ptr = next_count.data()]
-       __device__ (size_t i) {
-         auto tup = current_frontier_ptr[i];
-         vertex_t u = thrust::get<0>(tup);
-         source_idx_t src_idx = thrust::get<1>(tup);
-         auto parent_idx = u * num_sources + src_idx;
-         vertex_t parent_dist = distances_ptr[parent_idx];
-         edge_t parent_sigma = sigmas_ptr[parent_idx];
-         for (auto j = offsets[u]; j < offsets[u + 1]; ++j) {
-           vertex_t v = indices[j];
-           auto idx = v * num_sources + src_idx;
-           // Atomically set distance if not visited
-           if (atomicCAS(&distances_ptr[idx], invalid_distance, parent_dist + 1) == invalid_distance) {
-             // First time visiting v for this source
-             atomicExch(reinterpret_cast<unsigned long long int*>(&sigmas_ptr[idx]), static_cast<unsigned long long int>(parent_sigma));
-             // Add to next frontier
-             unsigned int pos = atomicAdd(next_count_ptr, 1);
-             next_frontier_ptr[pos] = thrust::make_tuple(v, src_idx);
-           } else if (distances_ptr[idx] == parent_dist + 1) {
-             // Another shortest path found
-             atomicAdd(&sigmas_ptr[idx], parent_sigma);
-           }
-         }
-       });
-     // Resize next_frontier to actual size    
-     unsigned int h_next_size = 0;
-     raft::update_host(&h_next_size, next_count.data(), 1, handle.get_stream());
-     handle.sync_stream();
-     next_frontier.resize(h_next_size, handle.get_stream());
-     // Swap frontiers
-     current_frontier = std::move(next_frontier);
-     next_frontier.resize(0, handle.get_stream());
-   }
- 
-   return std::make_tuple(std::move(distances), std::move(sigmas));
- }
+      __device__ (size_t i) {
+        auto tup = current_frontier_ptr[i];
+        vertex_t u = thrust::get<0>(tup);
+        source_idx_t src_idx = thrust::get<1>(tup);
+        auto parent_idx = u * num_sources + src_idx;
+        vertex_t parent_dist = distances_ptr[parent_idx];
+        edge_t parent_sigma = sigmas_ptr[parent_idx];
+        for (auto j = offsets[u]; j < offsets[u + 1]; ++j) {
+          vertex_t v = indices[j];
+          auto idx = v * num_sources + src_idx;
+          // Atomically set distance if not visited
+          if (atomicCAS(&distances_ptr[idx], invalid_distance, parent_dist + 1) == invalid_distance) {
+            // First time visiting v for this source
+            atomicExch(reinterpret_cast<unsigned long long int*>(&sigmas_ptr[idx]), static_cast<unsigned long long int>(parent_sigma));
+            // Add to next frontier
+            unsigned int pos = atomicAdd(next_count_ptr, 1);
+            next_frontier_ptr[pos] = thrust::make_tuple(v, src_idx);
+          } else if (distances_ptr[idx] == parent_dist + 1) {
+            // Another shortest path found
+            atomicAdd(&sigmas_ptr[idx], parent_sigma);
+          }
+        }
+      });
+    // Resize next_frontier to actual size
+    unsigned int h_next_size = 0;
+    raft::update_host(&h_next_size, next_count.data(), 1, handle.get_stream());
+    handle.sync_stream();
+      next_frontier.resize(h_next_size, handle.get_stream());
+      // Swap frontiers
+      current_frontier = std::move(next_frontier);
+      next_frontier.resize(0, handle.get_stream());
+  }
+
+  return std::make_tuple(std::move(distances), std::move(sigmas));
+}
  
  // Parallel backward pass for dependency accumulation
  // Accepts distances_map and sigmas_map from concurrent_bfs
