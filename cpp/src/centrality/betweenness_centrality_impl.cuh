@@ -12,6 +12,28 @@
  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
  * See the License for the specific language governing permissions and
  * limitations under the License.
+ *
+ * MULTI-GPU DEBUGGING MODES:
+ *
+ * To isolate multi-GPU failures, set the MG_DEBUG_MODE environment variable:
+ *
+ * 1. MG_DEBUG_MODE=multisource_bfs_single_backward
+ *    - Uses multisource_bfs for BFS phase
+ *    - Uses single source accumulate_vertex_results for backward pass
+ *    - Tests if failure is in BFS phase
+ *
+ * 2. MG_DEBUG_MODE=single_bfs_multisource_backward
+ *    - Uses single source brandes_bfs for BFS phase
+ *    - Uses multisource_backward_pass for backward pass
+ *    - Tests if failure is in backward pass phase
+ *
+ * 3. MG_DEBUG_MODE=sequential (default)
+ *    - Uses sequential brandes_bfs + accumulate_vertex_results
+ *    - Known working approach for multi-GPU
+ *
+ * Example usage:
+ * export MG_DEBUG_MODE=multisource_bfs_single_backward
+ * mpirun -n 4 ./tests/centrality/mg_betweenness_centrality_test
  */
 #pragma once
 
@@ -1232,36 +1254,206 @@ rmm::device_uvector<weight_t> betweenness_centrality(
   size_t batch_number      = 0;
 
   if constexpr (multi_gpu) {
-    // Multi-GPU: Use sequential brandes_bfs (more reliable for cross-GPU)
-    printf("[DEBUG] Running SEQUENTIAL version (multi-GPU mode)\n");
+    // Multi-GPU: Test different approaches to isolate issues
+    printf("[DEBUG] Running MULTI-GPU mode with debugging options\n");
 
-    // Process each source individually using brandes_bfs
-    for (size_t source_idx = 0; source_idx < num_sources; ++source_idx) {
-      //
-      //  BFS
-      //
-      constexpr size_t bucket_idx_cur = 0;
-      constexpr size_t num_buckets    = 2;
+    // Check environment variable for debugging mode
+    std::string debug_mode =
+      std::getenv("MG_DEBUG_MODE") ? std::getenv("MG_DEBUG_MODE") : "sequential";
 
-      vertex_frontier_t<vertex_t, void, multi_gpu, true> vertex_frontier(handle, num_buckets);
+    if (debug_mode == "multisource_bfs_single_backward") {
+      // DEBUG MODE: Use multisource_bfs + single source accumulate_vertex_results
+      printf("[DEBUG] Using multisource_bfs + single source accumulate_vertex_results\n");
 
-      if ((source_idx >= source_offsets[my_rank]) && (source_idx < source_offsets[my_rank + 1])) {
-        vertex_frontier.bucket(bucket_idx_cur)
-          .insert(vertices_begin + (source_idx - source_offsets[my_rank]),
-                  vertices_begin + (source_idx - source_offsets[my_rank]) + 1);
+      // Process sources in batches using multisource_bfs
+      size_t processed_sources = 0;
+      size_t batch_size        = std::min(current_batch_size, num_sources);
+
+      while (processed_sources < num_sources) {
+        size_t actual_batch_size = std::min(batch_size, num_sources - processed_sources);
+
+        printf("[DEBUG] Processing batch %zu-%zu (size: %zu)\n",
+               processed_sources,
+               processed_sources + actual_batch_size - 1,
+               actual_batch_size);
+
+        // Create iterators for current batch
+        auto batch_begin = vertices_begin + processed_sources;
+        auto batch_end   = vertices_begin + processed_sources + actual_batch_size;
+
+        // Use multisource_bfs for the batch
+        auto [distances_2d, sigmas_2d] = detail::multisource_bfs(
+          handle, graph_view, edge_weight_view, batch_begin, batch_end, do_expensive_check);
+
+        // Convert 2D arrays to 1D and process each source individually
+        auto num_vertices = graph_view.local_vertex_partition_range_size();
+
+        for (size_t batch_source_idx = 0; batch_source_idx < actual_batch_size;
+             ++batch_source_idx) {
+          size_t global_source_idx = processed_sources + batch_source_idx;
+
+          // Extract 1D arrays for this source from the 2D arrays
+          rmm::device_uvector<vertex_t> distances_1d(num_vertices, handle.get_stream());
+          rmm::device_uvector<edge_t> sigmas_1d(num_vertices, handle.get_stream());
+
+          auto src_offset = batch_source_idx * num_vertices;
+          raft::copy(distances_1d.data(),
+                     distances_2d.data() + src_offset,
+                     num_vertices,
+                     handle.get_stream());
+          raft::copy(
+            sigmas_1d.data(), sigmas_2d.data() + src_offset, num_vertices, handle.get_stream());
+
+          // Debug: Print some values to verify conversion
+          if (do_expensive_check && global_source_idx < 2) {
+            printf("[DEBUG] Source %zu - Sample distances: ", global_source_idx);
+            std::vector<vertex_t> h_distances(5);
+            raft::update_host(h_distances.data(), distances_1d.data(), 5, handle.get_stream());
+            handle.sync_stream();
+            for (int i = 0; i < 5; ++i) {
+              printf("%ld ", static_cast<long>(h_distances[i]));
+            }
+            printf("\n");
+          }
+
+          // Use single source accumulate_vertex_results
+          detail::accumulate_vertex_results(
+            handle,
+            graph_view,
+            edge_weight_view,
+            raft::device_span<weight_t>{centralities.data(), centralities.size()},
+            std::move(distances_1d),
+            std::move(sigmas_1d),
+            include_endpoints,
+            do_expensive_check);
+        }
+
+        processed_sources += actual_batch_size;
+        printf(
+          "[DEBUG] Completed batch, total processed: %zu/%zu\n", processed_sources, num_sources);
       }
 
-      auto [distances, sigmas] = detail::brandes_bfs(
-        handle, graph_view, edge_weight_view, vertex_frontier, do_expensive_check);
-      detail::accumulate_vertex_results(
+    } else if (debug_mode == "single_bfs_multisource_backward") {
+      // DEBUG MODE: Use single source brandes_bfs + multisource_backward_pass
+      printf("[DEBUG] Using single source brandes_bfs + multisource_backward_pass\n");
+
+      // Collect 1D arrays from brandes_bfs for each source
+      std::vector<rmm::device_uvector<vertex_t>> all_distances;
+      std::vector<rmm::device_uvector<edge_t>> all_sigmas;
+
+      for (size_t source_idx = 0; source_idx < num_sources; ++source_idx) {
+        // Single source BFS
+        vertex_frontier_t<vertex_t, void, multi_gpu, true> vertex_frontier(handle, 2);
+
+        if ((source_idx >= source_offsets[my_rank]) && (source_idx < source_offsets[my_rank + 1])) {
+          vertex_frontier.bucket(0).insert(
+            vertices_begin + (source_idx - source_offsets[my_rank]),
+            vertices_begin + (source_idx - source_offsets[my_rank]) + 1);
+        }
+
+        auto [distances, sigmas] = detail::brandes_bfs(
+          handle, graph_view, edge_weight_view, vertex_frontier, do_expensive_check);
+
+        // Store 1D arrays
+        all_distances.push_back(std::move(distances));
+        all_sigmas.push_back(std::move(sigmas));
+      }
+
+      // Convert 1D arrays to 2D format for multisource_backward_pass
+      auto num_vertices = graph_view.local_vertex_partition_range_size();
+      rmm::device_uvector<vertex_t> distances_2d(num_sources * num_vertices, handle.get_stream());
+      rmm::device_uvector<edge_t> sigmas_2d(num_sources * num_vertices, handle.get_stream());
+
+      // Copy each source's 1D data into the appropriate 2D slice
+      for (size_t source_idx = 0; source_idx < num_sources; ++source_idx) {
+        auto dst_offset = source_idx * num_vertices;
+
+        raft::copy(distances_2d.data() + dst_offset,
+                   all_distances[source_idx].data(),
+                   num_vertices,
+                   handle.get_stream());
+
+        raft::copy(sigmas_2d.data() + dst_offset,
+                   all_sigmas[source_idx].data(),
+                   num_vertices,
+                   handle.get_stream());
+      }
+
+      // Debug: Print some values to verify conversion
+      if (do_expensive_check) {
+        printf("[DEBUG] Converted 2D arrays - Sample values:\n");
+        for (size_t s = 0; s < std::min(num_sources, size_t(2)); ++s) {
+          for (size_t v = 0; v < std::min(static_cast<size_t>(num_vertices), size_t(3)); ++v) {
+            auto idx = s * static_cast<size_t>(num_vertices) + v;
+            printf("[DEBUG] Source %zu, Vertex %zu: distance=%ld, sigma=%ld\n",
+                   s,
+                   v,
+                   distances_2d.data()[idx],
+                   sigmas_2d.data()[idx]);
+          }
+        }
+      }
+
+      // Debug: Print vertex partition information before multisource_backward_pass
+      if (do_expensive_check) {
+        auto vertex_partition_range_last = graph_view.vertex_partition_range_last();
+        printf("[DEBUG] Vertex partition ranges: ");
+        for (size_t i = 0; i < vertex_partition_range_last.size(); ++i) {
+          printf("GPU%zu: 0-%ld ", i, vertex_partition_range_last[i]);
+        }
+        printf("\n");
+
+        printf("[DEBUG] About to call multisource_backward_pass with %zu sources, %ld vertices\n",
+               num_sources,
+               num_vertices);
+        printf("[DEBUG] Centralities array size: %zu\n", centralities.size());
+      }
+
+      // Now use multisource_backward_pass with the converted 2D data
+      detail::multisource_backward_pass(
         handle,
         graph_view,
         edge_weight_view,
         raft::device_span<weight_t>{centralities.data(), centralities.size()},
-        std::move(distances),
-        std::move(sigmas),
+        std::move(distances_2d),
+        std::move(sigmas_2d),
+        vertices_begin,
+        vertices_begin + num_sources,
         include_endpoints,
         do_expensive_check);
+
+    } else {
+      // DEFAULT: Use sequential brandes_bfs (more reliable for cross-GPU)
+      printf("[DEBUG] Using sequential brandes_bfs (default multi-GPU mode)\n");
+
+      // Process each source individually using brandes_bfs
+      for (size_t source_idx = 0; source_idx < num_sources; ++source_idx) {
+        //
+        //  BFS
+        //
+        constexpr size_t bucket_idx_cur = 0;
+        constexpr size_t num_buckets    = 2;
+
+        vertex_frontier_t<vertex_t, void, multi_gpu, true> vertex_frontier(handle, num_buckets);
+
+        if ((source_idx >= source_offsets[my_rank]) && (source_idx < source_offsets[my_rank + 1])) {
+          vertex_frontier.bucket(bucket_idx_cur)
+            .insert(vertices_begin + (source_idx - source_offsets[my_rank]),
+                    vertices_begin + (source_idx - source_offsets[my_rank]) + 1);
+        }
+
+        auto [distances, sigmas] = detail::brandes_bfs(
+          handle, graph_view, edge_weight_view, vertex_frontier, do_expensive_check);
+        detail::accumulate_vertex_results(
+          handle,
+          graph_view,
+          edge_weight_view,
+          raft::device_span<weight_t>{centralities.data(), centralities.size()},
+          std::move(distances),
+          std::move(sigmas),
+          include_endpoints,
+          do_expensive_check);
+      }
     }
   } else {
     // Single-GPU: Use adaptive batching
