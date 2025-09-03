@@ -563,10 +563,10 @@ std::tuple<rmm::device_uvector<vertex_t>, rmm::device_uvector<edge_t>> multisour
   auto num_vertices = graph_view.local_vertex_partition_range_size();
   auto num_sources  = cuda::std::distance(sources_first, sources_last);
 
-  using origin_t = uint16_t;
+  using origin_t = uint32_t;
   CUGRAPH_EXPECTS(
     num_sources <= std::numeric_limits<origin_t>::max(),
-    "Number of sources exceeds maximum value for origin_t (uint16_t), would cause overflow");
+    "Number of sources exceeds maximum value for origin_t (uint32_t), would cause overflow");
 
   rmm::device_uvector<edge_t> sigmas_2d(num_sources * num_vertices, handle.get_stream());
   rmm::device_uvector<vertex_t> distances_2d(num_sources * num_vertices, handle.get_stream());
@@ -581,6 +581,9 @@ std::tuple<rmm::device_uvector<vertex_t>, rmm::device_uvector<edge_t>> multisour
 
   // Initialize sources with their origins using zip iterator approach
   if (num_sources > 0) {
+    std::cout << "[DEBUG] GPU " << handle.get_comms().get_rank() << ": Initializing " << num_sources
+              << " sources in multisource_bfs" << std::endl;
+
     // Create zip iterator for (vertex, origin) pairs
     auto pair_first =
       thrust::make_zip_iterator(sources_first, thrust::make_counting_iterator(origin_t{0}));
@@ -588,6 +591,9 @@ std::tuple<rmm::device_uvector<vertex_t>, rmm::device_uvector<edge_t>> multisour
 
     // Insert tagged sources into frontier
     vertex_frontier.bucket(bucket_idx_cur).insert(pair_first, pair_last);
+
+    std::cout << "[DEBUG] GPU " << handle.get_comms().get_rank()
+              << ": Successfully inserted sources into frontier" << std::endl;
 
     // Initialize distances and sigmas for sources
     thrust::for_each(handle.get_thrust_policy(),
@@ -609,7 +615,13 @@ std::tuple<rmm::device_uvector<vertex_t>, rmm::device_uvector<edge_t>> multisour
 
   edge_t hop{0};
 
+  std::cout << "[DEBUG] GPU " << handle.get_comms().get_rank() << ": Starting BFS main loop"
+            << std::endl;
+
   while (vertex_frontier.bucket(bucket_idx_cur).aggregate_size() > 0) {
+    std::cout << "[DEBUG] GPU " << handle.get_comms().get_rank() << ": BFS iteration " << hop
+              << ", frontier size: " << vertex_frontier.bucket(bucket_idx_cur).aggregate_size()
+              << std::endl;
     // Step 1: Extract ALL edges from frontier (filtered by unvisited vertices)
     using bfs_edge_tuple_t = cuda::std::tuple<vertex_t, origin_t, edge_t>;
 
@@ -647,6 +659,9 @@ std::tuple<rmm::device_uvector<vertex_t>, rmm::device_uvector<edge_t>> multisour
     auto& frontier_vertices = std::get<0>(new_frontier_tagged_vertex_buffer);
     auto& frontier_origins  = std::get<1>(new_frontier_tagged_vertex_buffer);
     auto& sigmas            = std::get<2>(new_frontier_tagged_vertex_buffer);
+
+    std::cout << "[DEBUG] GPU " << handle.get_comms().get_rank() << ": Extracted "
+              << frontier_vertices.size() << " edges from frontier" << std::endl;
 
     // Step 2: Reduce by (destination, origin) - sums sigmas for multiple paths
     // Sort by (destination, origin) pairs
@@ -704,7 +719,13 @@ std::tuple<rmm::device_uvector<vertex_t>, rmm::device_uvector<edge_t>> multisour
 
     vertex_frontier.swap_buckets(bucket_idx_cur, bucket_idx_next);
     ++hop;
+
+    std::cout << "[DEBUG] GPU " << handle.get_comms().get_rank() << ": Completed BFS iteration "
+              << (hop - 1) << std::endl;
   }
+
+  std::cout << "[DEBUG] GPU " << handle.get_comms().get_rank()
+            << ": Completed multisource_bfs with " << hop << " iterations" << std::endl;
 
   return std::make_tuple(std::move(distances_2d), std::move(sigmas_2d));
 }
@@ -729,10 +750,10 @@ void multisource_backward_pass(
   auto num_vertices = static_cast<size_t>(graph_view.local_vertex_partition_range_size());
   auto num_sources  = cuda::std::distance(sources_first, sources_last);
 
-  using origin_t = uint16_t;
+  using origin_t = uint32_t;
   CUGRAPH_EXPECTS(
     num_sources <= std::numeric_limits<origin_t>::max(),
-    "Number of sources exceeds maximum value for origin_t (uint16_t), would cause overflow");
+    "Number of sources exceeds maximum value for origin_t (uint32_t), would cause overflow");
 
   thrust::fill(handle.get_thrust_policy(), centralities.begin(), centralities.end(), weight_t{0});
 
@@ -753,6 +774,10 @@ void multisource_backward_pass(
                                                 d_first + distances_2d.size(),
                                                 vertex_t{0},
                                                 thrust::maximum<vertex_t>());
+
+  std::cout << "[DEBUG] GPU " << handle.get_comms().get_rank()
+            << ": Starting multisource_backward_pass with " << num_sources
+            << " sources, max distance: " << global_max_distance << std::endl;
 
   // Pre-compute: Partition all (vertex, source) pairs by distance once
   // This eliminates the need to scan the distance array global_max_distance times
@@ -930,8 +955,14 @@ void multisource_backward_pass(
     }
   }
 
+  std::cout << "[DEBUG] GPU " << handle.get_comms().get_rank()
+            << ": Starting distance level processing from " << global_max_distance << " to 1"
+            << std::endl;
+
   // Process distance levels using pre-computed buckets (now with sorted vertices)
   for (vertex_t d = global_max_distance; d > 1; --d) {
+    std::cout << "[DEBUG] GPU " << handle.get_comms().get_rank() << ": Processing distance level "
+              << d << std::endl;
     // Step 1: Create vertex frontier with all vertices at distance d-1 for all sources
     // Use tagged vertices with (vertex, source_idx) pairs
     using tagged_vertex_t = cuda::std::tuple<vertex_t, size_t>;
@@ -1187,38 +1218,224 @@ rmm::device_uvector<weight_t> betweenness_centrality(
   }
 
   if constexpr (multi_gpu) {
-    // Multi-GPU: Use sequential version
-    for (size_t source_idx = 0; source_idx < num_sources; ++source_idx) {
-      //
-      //  BFS
-      //
-      constexpr size_t bucket_idx_cur = 0;
-      constexpr size_t num_buckets    = 2;
+    // Multi-GPU: Test different approaches based on environment variable
+    std::string mg_mode =
+      std::getenv("MG_DEBUG_MODE") ? std::getenv("MG_DEBUG_MODE") : "sequential_sequential";
 
-      vertex_frontier_t<vertex_t, void, multi_gpu, true> vertex_frontier(handle, num_buckets);
+    if (mg_mode == "sequential_parallel") {
+      // Test sequential BFS + parallel backward pass
+      std::cout << "[DEBUG] GPU " << handle.get_comms().get_rank()
+                << ": Testing sequential BFS + parallel backward pass" << std::endl;
 
-      if ((source_idx >= source_offsets[my_rank]) && (source_idx < source_offsets[my_rank + 1])) {
-        vertex_frontier.bucket(bucket_idx_cur)
-          .insert(vertices_begin + (source_idx - source_offsets[my_rank]),
-                  vertices_begin + (source_idx - source_offsets[my_rank]) + 1);
+      // Collect 1D arrays from sequential brandes_bfs for each source
+      std::vector<rmm::device_uvector<vertex_t>> all_distances;
+      std::vector<rmm::device_uvector<edge_t>> all_sigmas;
+
+      for (size_t source_idx = 0; source_idx < num_sources; ++source_idx) {
+        // Single source BFS (sequential)
+        vertex_frontier_t<vertex_t, void, multi_gpu, true> vertex_frontier(handle, 2);
+
+        if ((source_idx >= source_offsets[my_rank]) && (source_idx < source_offsets[my_rank + 1])) {
+          vertex_frontier.bucket(0).insert(
+            vertices_begin + (source_idx - source_offsets[my_rank]),
+            vertices_begin + (source_idx - source_offsets[my_rank]) + 1);
+        }
+
+        auto [distances, sigmas] = detail::brandes_bfs(
+          handle, graph_view, edge_weight_view, vertex_frontier, do_expensive_check);
+
+        // Store 1D arrays
+        all_distances.push_back(std::move(distances));
+        all_sigmas.push_back(std::move(sigmas));
       }
 
-      auto [distances, sigmas] = detail::brandes_bfs(
-        handle, graph_view, edge_weight_view, vertex_frontier, do_expensive_check);
-      detail::accumulate_vertex_results(
+      // Convert 1D arrays to 2D format for multisource_backward_pass
+      auto num_vertices = graph_view.local_vertex_partition_range_size();
+      rmm::device_uvector<vertex_t> distances_2d(num_sources * num_vertices, handle.get_stream());
+      rmm::device_uvector<edge_t> sigmas_2d(num_sources * num_vertices, handle.get_stream());
+
+      // Copy each source's 1D data into the appropriate 2D slice
+      for (size_t source_idx = 0; source_idx < num_sources; ++source_idx) {
+        auto dst_offset = source_idx * num_vertices;
+
+        raft::copy(distances_2d.data() + dst_offset,
+                   all_distances[source_idx].data(),
+                   num_vertices,
+                   handle.get_stream());
+
+        raft::copy(sigmas_2d.data() + dst_offset,
+                   all_sigmas[source_idx].data(),
+                   num_vertices,
+                   handle.get_stream());
+      }
+
+      std::cout << "[DEBUG] GPU " << handle.get_comms().get_rank()
+                << ": Starting parallel backward pass" << std::endl;
+
+      // Now use multisource_backward_pass with the converted 2D data
+      detail::multisource_backward_pass(
         handle,
         graph_view,
         edge_weight_view,
         raft::device_span<weight_t>{centralities.data(), centralities.size()},
-        std::move(distances),
-        std::move(sigmas),
+        std::move(distances_2d),
+        std::move(sigmas_2d),
+        vertices_begin,
+        vertices_begin + num_sources,
         include_endpoints,
         do_expensive_check);
+
+      std::cout << "[DEBUG] GPU " << handle.get_comms().get_rank()
+                << ": Completed sequential BFS + parallel backward pass" << std::endl;
+
+    } else if (mg_mode == "parallel_sequential") {
+      // Test parallel BFS + sequential backward pass
+      std::cout << "[DEBUG] GPU " << handle.get_comms().get_rank()
+                << ": Testing parallel BFS + sequential backward pass" << std::endl;
+
+      // Process sources in batches to respect origin_t (uint32_t) limit
+      constexpr size_t max_sources_per_batch = std::numeric_limits<uint32_t>::max();
+
+      size_t num_sources = cuda::std::distance(vertices_begin, vertices_end);
+      size_t num_batches = (num_sources + max_sources_per_batch - 1) / max_sources_per_batch;
+
+      for (size_t batch_idx = 0; batch_idx < num_batches; ++batch_idx) {
+        size_t batch_start = batch_idx * max_sources_per_batch;
+        size_t batch_end   = std::min(batch_start + max_sources_per_batch, num_sources);
+
+        auto batch_vertices_begin = vertices_begin + batch_start;
+        auto batch_vertices_end   = vertices_begin + batch_end;
+
+        std::cout << "[DEBUG] GPU " << handle.get_comms().get_rank() << ": Processing batch "
+                  << batch_idx << " with " << (batch_end - batch_start) << " sources" << std::endl;
+
+        auto [distances_2d, sigmas_2d] = detail::multisource_bfs(handle,
+                                                                 graph_view,
+                                                                 edge_weight_view,
+                                                                 batch_vertices_begin,
+                                                                 batch_vertices_end,
+                                                                 do_expensive_check);
+
+        std::cout << "[DEBUG] GPU " << handle.get_comms().get_rank()
+                  << ": Completed multisource_bfs for batch " << batch_idx << std::endl;
+
+        // Convert 2D arrays to 1D and process each source individually (sequential backward)
+        auto num_vertices = graph_view.local_vertex_partition_range_size();
+
+        for (size_t batch_source_idx = 0; batch_source_idx < (batch_end - batch_start);
+             ++batch_source_idx) {
+          // Extract 1D arrays for this source from the 2D arrays
+          rmm::device_uvector<vertex_t> distances_1d(num_vertices, handle.get_stream());
+          rmm::device_uvector<edge_t> sigmas_1d(num_vertices, handle.get_stream());
+
+          auto src_offset = batch_source_idx * num_vertices;
+          raft::copy(distances_1d.data(),
+                     distances_2d.data() + src_offset,
+                     num_vertices,
+                     handle.get_stream());
+          raft::copy(
+            sigmas_1d.data(), sigmas_2d.data() + src_offset, num_vertices, handle.get_stream());
+
+          // Use single source accumulate_vertex_results (sequential backward)
+          detail::accumulate_vertex_results(
+            handle,
+            graph_view,
+            edge_weight_view,
+            raft::device_span<weight_t>{centralities.data(), centralities.size()},
+            std::move(distances_1d),
+            std::move(sigmas_1d),
+            include_endpoints,
+            do_expensive_check);
+        }
+
+        std::cout << "[DEBUG] GPU " << handle.get_comms().get_rank()
+                  << ": Completed parallel BFS + sequential backward for batch " << batch_idx
+                  << std::endl;
+      }
+
+    } else if (mg_mode == "parallel_parallel") {
+      // Test parallel BFS + parallel backward pass (expected to fail)
+      std::cout << "[DEBUG] GPU " << handle.get_comms().get_rank()
+                << ": Testing parallel BFS + parallel backward pass" << std::endl;
+
+      // Process sources in batches to respect origin_t (uint32_t) limit
+      constexpr size_t max_sources_per_batch = std::numeric_limits<uint32_t>::max();
+
+      size_t num_sources = cuda::std::distance(vertices_begin, vertices_end);
+      size_t num_batches = (num_sources + max_sources_per_batch - 1) / max_sources_per_batch;
+
+      for (size_t batch_idx = 0; batch_idx < num_batches; ++batch_idx) {
+        size_t batch_start = batch_idx * max_sources_per_batch;
+        size_t batch_end   = std::min(batch_start + max_sources_per_batch, num_sources);
+
+        auto batch_vertices_begin = vertices_begin + batch_start;
+        auto batch_vertices_end   = vertices_begin + batch_end;
+
+        std::cout << "[DEBUG] GPU " << handle.get_comms().get_rank() << ": Processing batch "
+                  << batch_idx << " with " << (batch_end - batch_start) << " sources" << std::endl;
+
+        auto [distances_2d, sigmas_2d] = detail::multisource_bfs(handle,
+                                                                 graph_view,
+                                                                 edge_weight_view,
+                                                                 batch_vertices_begin,
+                                                                 batch_vertices_end,
+                                                                 do_expensive_check);
+
+        std::cout << "[DEBUG] GPU " << handle.get_comms().get_rank()
+                  << ": Completed multisource_bfs for batch " << batch_idx << std::endl;
+
+        detail::multisource_backward_pass(
+          handle,
+          graph_view,
+          edge_weight_view,
+          raft::device_span<weight_t>{centralities.data(), centralities.size()},
+          std::move(distances_2d),
+          std::move(sigmas_2d),
+          batch_vertices_begin,
+          batch_vertices_end,
+          include_endpoints,
+          do_expensive_check);
+
+        std::cout << "[DEBUG] GPU " << handle.get_comms().get_rank()
+                  << ": Completed multisource_backward_pass for batch " << batch_idx << std::endl;
+      }
+    } else {
+      // Default: Use sequential version (known working)
+      std::cout << "[DEBUG] GPU " << handle.get_comms().get_rank()
+                << ": Using sequential BFS + sequential backward (known working)" << std::endl;
+
+      for (size_t source_idx = 0; source_idx < num_sources; ++source_idx) {
+        //
+        //  BFS
+        //
+        constexpr size_t bucket_idx_cur = 0;
+        constexpr size_t num_buckets    = 2;
+
+        vertex_frontier_t<vertex_t, void, multi_gpu, true> vertex_frontier(handle, num_buckets);
+
+        if ((source_idx >= source_offsets[my_rank]) && (source_idx < source_offsets[my_rank + 1])) {
+          vertex_frontier.bucket(bucket_idx_cur)
+            .insert(vertices_begin + (source_idx - source_offsets[my_rank]),
+                    vertices_begin + (source_idx - source_offsets[my_rank]) + 1);
+        }
+
+        auto [distances, sigmas] = detail::brandes_bfs(
+          handle, graph_view, edge_weight_view, vertex_frontier, do_expensive_check);
+        detail::accumulate_vertex_results(
+          handle,
+          graph_view,
+          edge_weight_view,
+          raft::device_span<weight_t>{centralities.data(), centralities.size()},
+          std::move(distances),
+          std::move(sigmas),
+          include_endpoints,
+          do_expensive_check);
+      }
     }
   } else {
     // Single-GPU: Use parallel version
-    // Process sources in batches to respect origin_t (uint16_t) limit
-    constexpr size_t max_sources_per_batch = std::numeric_limits<uint16_t>::max();
+    // Process sources in batches to respect origin_t (uint32_t) limit
+    constexpr size_t max_sources_per_batch = std::numeric_limits<uint32_t>::max();
 
     size_t num_sources = cuda::std::distance(vertices_begin, vertices_end);
     size_t num_batches = (num_sources + max_sources_per_batch - 1) / max_sources_per_batch;
