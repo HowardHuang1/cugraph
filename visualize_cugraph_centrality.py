@@ -26,7 +26,7 @@ def create_centrality_visualization(centrality_dict, map_type="warehouse"):
             "TTTTTTTTTTTT"
         ],
         "medium": [
-            "TTTTTTTTTTTTTTTTTT",
+            "TTTTTTTTTTTTTTTTTTTT",
             "T..................T",
             "T..................T",
             "T..................T",
@@ -39,7 +39,7 @@ def create_centrality_visualization(centrality_dict, map_type="warehouse"):
             "T..................T",
             "T..................T",
             "T..................T",
-            "TTTTTTTTTTTTTTTTTT"
+            "TTTTTTTTTTTTTTTTTTTT"
         ],
         "large": [
             "TTTTTTTTTTTTTTTTTTTTTTTTTTTT",
@@ -63,6 +63,52 @@ def create_centrality_visualization(centrality_dict, map_type="warehouse"):
             "T..........................T",
             "T..........................T",
             "TTTTTTTTTTTTTTTTTTTTTTTTTTTT"
+        ],
+        "warehouse_small": [
+            "TTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTT",
+            "T......................................................T",
+            "T.........TTTTTT.TTTTTT.TTTTTT.TTTTTT.TTTTTT...........T",
+            "T.........TTTTTT.TTTTTT.TTTTTT.TTTTTT.TTTTTT...........T",
+            "T......................................................T",
+            "T.........TTTTTT.TTTTTT.TTTTTT.TTTTTT.TTTTTT...........T",
+            "T.........TTTTTT.TTTTTT.TTTTTT.TTTTTT.TTTTTT...........T",
+            "T......................................................T",
+            "T.........TTTTTT.TTTTTT.TTTTTT.TTTTTT.TTTTTT...........T",
+            "T.........TTTTTT.TTTTTT.TTTTTT.TTTTTT.TTTTTT...........T",
+            "T......................................................T",
+            "T.........TTTTTT.TTTTTT.TTTTTT.TTTTTT.TTTTTT...........T",
+            "T.........TTTTTT.TTTTTT.TTTTTT.TTTTTT.TTTTTT...........T",
+            "T......................................................T",
+            "T.........TTTTTT.TTTTTT.TTTTTT.TTTTTT.TTTTTT...........T",
+            "T.........TTTTTT.TTTTTT.TTTTTT.TTTTTT.TTTTTT...........T",
+            "T......................................................T",
+            "T.........TTTTTT.TTTTTT.TTTTTT.TTTTTT.TTTTTT...........T",
+            "T.........TTTTTT.TTTTTT.TTTTTT.TTTTTT.TTTTTT...........T",
+            "T......................................................T",
+            "TTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTT"
+        ],
+        "irregular_warehouse": [
+            "TTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTT",
+            "T..TTTTTT......................................TTTTTTTTT",
+            "T...TTTTTT.........TTTT.........................TTTTTTTT",
+            "T..TTTTTTT...........TTTTT.......TTT..............TTTTTT",
+            "T...TTTTTTT............TTTTT....TTTTTT...........TTTTTTT",
+            "T................................TTTTTT...........TTTTTT",
+            "T........TTT...TTTT............TTTTTTT.....TT........TTT",
+            "T........TTTTTTTTT...............TTTT......TTT.........T",
+            "T.....TTTTTTTTTTT.........................TTTTTT.......T",
+            "T....TTTTTTTTTT.....TTT...................TTTTTTTTT....T",
+            "T..........TTTTT....TTTTTTTTT..............TTTTTTT.....T",
+            "T..................TTTTTTTTTT.............TTTT.........T",
+            "T................TTTTTTTTTTTTTT........................T",
+            "T.................TTTTTTTTTTTTTTT......................T",
+            "T...TTT...TTT.....TTTTTTTTTTT........TTTT..........TTT.T",
+            "T..TTTTTTTTTTT......TTTTTT..........TTT..........TTTTT.T",
+            "T...TTT...TTTT........TTT..........TTTT........TTTTTT..T",
+            "T..................................TTTTT...TTTTTTTTT...T",
+            "T..................................TTT........TTTTTT...T",
+            "T................................................TTTT..T",
+            "TTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTT"
         ]
     }
 
@@ -70,25 +116,31 @@ def create_centrality_visualization(centrality_dict, map_type="warehouse"):
     map_grid = map_grids.get(map_type, map_grids["small"])
 
     # Create centrality grid
-    height, width = len(map_grid), len(map_grid[0])
+    height = len(map_grid)
+    width = max(len(row) for row in map_grid)  # Use max width for consistency
     centrality_array = np.zeros((height, width))
 
     # Map node IDs to grid positions (row-major order) - same as NetworkX script
     node_idx = 0
     for row in range(height):
-        for col in range(width):
+        for col in range(len(map_grid[row])):  # Only iterate over actual map width
             if map_grid[row][col] == '.':
                 if node_idx in centrality_dict:
                     centrality_array[row][col] = centrality_dict[node_idx]
                 node_idx += 1
 
-    # Create the plot
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 6))
+    # Create the plot with different sizes for left and right
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(20, 8), gridspec_kw={'width_ratios': [1, 2]})
 
     # Plot 1: Original map
     original_matrix = []
+    max_width = max(len(row) for row in map_grid)  # Find the maximum width
     for row in map_grid:
-        original_matrix.append([1 if c == '.' else 0 for c in row])
+        # Pad shorter rows with 0s (walls) to make all rows the same length
+        padded_row = [1 if c == '.' else 0 for c in row]
+        while len(padded_row) < max_width:
+            padded_row.append(0)  # Add wall (0) for padding
+        original_matrix.append(padded_row)
 
     ax1.imshow(original_matrix, cmap='gray', aspect='equal', vmin=0, vmax=1)
     ax1.set_title('Original Map (Black=Walls, White=Paths)')
@@ -100,26 +152,20 @@ def create_centrality_visualization(centrality_dict, map_type="warehouse"):
     ax1.set_yticks(range(height))
     ax1.grid(True, alpha=0.3)
 
-    # Highlight bottleneck areas based on map type
-    if map_type == "small":
-        bottleneck_row, bottleneck_cols = 4, [5, 6]
-        for col in bottleneck_cols:
-            ax1.add_patch(plt.Rectangle((col-0.5, bottleneck_row-0.5), 1, 1,
-                                       fill=False, edgecolor='red', linewidth=3))
-    elif map_type == "medium":
-        # Two bottlenecks in medium map
-        bottlenecks = [(4, [5, 6]), (9, [5, 6])]
-        for row, cols in bottlenecks:
-            for col in cols:
-                ax1.add_patch(plt.Rectangle((col-0.5, row-0.5), 1, 1,
-                                           fill=False, edgecolor='red', linewidth=3))
-    elif map_type == "large":
-        # Three bottlenecks in large map
-        bottlenecks = [(5, [5, 6]), (10, [5, 6]), (15, [5, 6])]
-        for row, cols in bottlenecks:
-            for col in cols:
-                ax1.add_patch(plt.Rectangle((col-0.5, row-0.5), 1, 1,
-                                           fill=False, edgecolor='red', linewidth=3))
+    # Highlight actual high centrality nodes instead of hardcoded positions
+    # Find top 4 nodes by centrality
+    sorted_centrality = sorted(centrality_dict.items(), key=lambda x: x[1], reverse=True)
+    top_nodes = sorted_centrality[:4]
+
+    # Map node IDs back to grid positions
+    node_idx = 0
+    for row in range(height):
+        for col in range(len(map_grid[row])):
+            if map_grid[row][col] == '.':
+                if node_idx in [node_id for node_id, _ in top_nodes]:
+                    ax1.add_patch(plt.Rectangle((col-0.5, row-0.5), 1, 1,
+                                               fill=False, edgecolor='red', linewidth=3))
+                node_idx += 1
 
     # Plot 2: Centrality visualization
     im = ax2.imshow(centrality_array, cmap='Reds', aspect='equal')
@@ -136,33 +182,25 @@ def create_centrality_visualization(centrality_dict, map_type="warehouse"):
     ax2.set_yticks(range(height))
     ax2.grid(True, alpha=0.3)
 
-    # Highlight bottleneck areas based on map type
-    if map_type == "small":
-        bottleneck_row, bottleneck_cols = 4, [5, 6]
-        for col in bottleneck_cols:
-            ax2.add_patch(plt.Rectangle((col-0.5, bottleneck_row-0.5), 1, 1,
-                                       fill=False, edgecolor='blue', linewidth=3))
-    elif map_type == "medium":
-        # Two bottlenecks in medium map
-        bottlenecks = [(4, [5, 6]), (9, [5, 6])]
-        for row, cols in bottlenecks:
-            for col in cols:
-                ax2.add_patch(plt.Rectangle((col-0.5, row-0.5), 1, 1,
-                                           fill=False, edgecolor='blue', linewidth=3))
-    elif map_type == "large":
-        # Three bottlenecks in large map
-        bottlenecks = [(5, [5, 6]), (10, [5, 6]), (15, [5, 6])]
-        for row, cols in bottlenecks:
-            for col in cols:
-                ax2.add_patch(plt.Rectangle((col-0.5, row-0.5), 1, 1,
-                                           fill=False, edgecolor='blue', linewidth=3))
-
-    # Add node numbers on the heatmap for high centrality nodes
+    # Highlight actual high centrality nodes instead of hardcoded positions
+    # Use the same top nodes as in the original map
     node_idx = 0
     for row in range(height):
-        for col in range(width):
+        for col in range(len(map_grid[row])):
             if map_grid[row][col] == '.':
-                if node_idx in centrality_dict and centrality_dict[node_idx] > 300:
+                if node_idx in [node_id for node_id, _ in top_nodes]:
+                    ax2.add_patch(plt.Rectangle((col-0.5, row-0.5), 1, 1,
+                                               fill=False, edgecolor='blue', linewidth=3))
+                node_idx += 1
+
+    # Add node numbers on the heatmap for only the top centrality nodes
+    node_idx = 0
+    # Only show top 15 nodes to reduce clutter
+    top_15_nodes = [node_id for node_id, _ in sorted_centrality[:15]]
+    for row in range(height):
+        for col in range(len(map_grid[row])):  # Only iterate over actual map width
+            if map_grid[row][col] == '.':
+                if node_idx in top_15_nodes:
                     ax2.text(col, row, str(node_idx), ha='center', va='center',
                             fontsize=8, fontweight='bold', color='white')
                 node_idx += 1
@@ -194,7 +232,7 @@ def main():
     if len(sys.argv) < 3:
         print("ERROR: Missing required arguments!")
         print("Usage: python3 visualize_cugraph_centrality.py <map_type> <csv_file>")
-        print("Map types: small, medium, large")
+        print("Map types: small, medium, large, warehouse_small, irregular_warehouse")
         print("Example: python3 visualize_cugraph_centrality.py small warehouse.csv")
         return
 
@@ -202,7 +240,7 @@ def main():
     csv_file = sys.argv[2]
 
     # Validate map type
-    valid_types = ["small", "medium", "large"]
+    valid_types = ["small", "medium", "large", "warehouse_small", "irregular_warehouse"]
     if map_type not in valid_types:
         print(f"ERROR: Invalid map type '{map_type}'!")
         print(f"Valid types: {', '.join(valid_types)}")
