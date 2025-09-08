@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 # Copyright (c) 2024-2025, NVIDIA CORPORATION.
 
+import os
+os.environ['NX_CUGRAPH_AUTOCONFIG'] = 'True'
+
 import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.colors import ListedColormap
@@ -18,8 +21,8 @@ def visualize_karate_graph():
     print(f"Number of edges: {G.number_of_edges()}")
     print()
 
-    # Calculate betweenness centrality using NetworkX
-    centrality = nx.betweenness_centrality(G)
+    # Calculate betweenness centrality using cuGraph (via nx-cugraph)
+    centrality = nx.betweenness_centrality(G, normalized=False, endpoints=True)
 
     # Get the top nodes by centrality
     sorted_centrality = sorted(centrality.items(), key=lambda x: x[1], reverse=True)
@@ -105,7 +108,7 @@ def visualize_karate_graph():
     plt.legend()
 
     plt.tight_layout()
-    plt.savefig('karate_centrality_analysis.png', dpi=300, bbox_inches='tight')
+    plt.savefig('cugraph_karate.png', dpi=300, bbox_inches='tight')
     plt.show()
 
     # Analyze the results
