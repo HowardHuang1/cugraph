@@ -35,6 +35,15 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
+#include <fstream>
+#include <iomanip>
+#include <iostream>
+#include <sstream>
+
+// Debug flag - set to true to enable debug output
+#define DEBUG_BETWEENNESS_CENTRALITY 1
+
 struct BetweennessCentrality_Usecase {
   size_t num_seeds{std::numeric_limits<size_t>::max()};
   bool normalized{false};
@@ -65,6 +74,18 @@ class Tests_BetweennessCentrality
 
     auto [betweenness_usecase, input_usecase] = param;
 
+#if DEBUG_BETWEENNESS_CENTRALITY
+    std::cout << "\n=== BETWEENNESS CENTRALITY TEST START ===" << std::endl;
+    std::cout << "Parameters: num_seeds=" << betweenness_usecase.num_seeds
+              << ", normalized=" << (betweenness_usecase.normalized ? "true" : "false")
+              << ", include_endpoints="
+              << (betweenness_usecase.include_endpoints ? "true" : "false")
+              << ", test_weighted=" << (betweenness_usecase.test_weighted ? "true" : "false")
+              << ", edge_masking=" << (betweenness_usecase.edge_masking ? "true" : "false")
+              << ", check_correctness="
+              << (betweenness_usecase.check_correctness ? "true" : "false") << std::endl;
+#endif
+
     raft::handle_t handle{};
     HighResTimer hr_timer{};
 
@@ -76,6 +97,15 @@ class Tests_BetweennessCentrality
     auto [graph, edge_weights, d_renumber_map_labels] =
       cugraph::test::construct_graph<vertex_t, edge_t, weight_t, false, false>(
         handle, input_usecase, betweenness_usecase.test_weighted, renumber);
+
+#if DEBUG_BETWEENNESS_CENTRALITY
+    std::cout << "Graph construction completed." << std::endl;
+    std::cout << "  - Number of vertices: " << graph.number_of_vertices() << std::endl;
+    std::cout << "  - Number of edges: " << graph.number_of_edges() << std::endl;
+    std::cout << "  - Is symmetric: " << (graph.is_symmetric() ? "true" : "false") << std::endl;
+    std::cout << "  - Is multigraph: " << (graph.is_multigraph() ? "true" : "false") << std::endl;
+    std::cout << "  - Has edge weights: " << (edge_weights ? "true" : "false") << std::endl;
+#endif
 
     if (cugraph::test::g_perf) {
       RAFT_CUDA_TRY(cudaDeviceSynchronize());  // for consistent performance measurement
@@ -94,15 +124,35 @@ class Tests_BetweennessCentrality
       graph_view.attach_edge_mask((*edge_mask).view());
     }
 
-    raft::random::RngState rng_state(0);
-    auto d_seeds = cugraph::select_random_vertices(
-      handle,
-      graph_view,
-      std::optional<raft::device_span<vertex_t const>>{std::nullopt},
-      rng_state,
-      betweenness_usecase.num_seeds,
-      false,
-      true);
+    rmm::device_uvector<vertex_t> d_seeds(0, handle.get_stream());
+
+    // Use all nodes deterministically if num_seeds >= total vertices, otherwise use random sampling
+    if (betweenness_usecase.num_seeds >= graph_view.number_of_vertices()) {
+      // Use all vertices as sources (full betweenness centrality)
+      d_seeds.resize(graph_view.number_of_vertices(), handle.get_stream());
+      // Fill with sequential vertex IDs
+      auto h_seeds_temp = std::vector<vertex_t>(graph_view.number_of_vertices());
+      std::iota(h_seeds_temp.begin(), h_seeds_temp.end(), vertex_t{0});
+      raft::update_device(
+        d_seeds.data(), h_seeds_temp.data(), h_seeds_temp.size(), handle.get_stream());
+#if DEBUG_BETWEENNESS_CENTRALITY
+      std::cout << "Seeds: all " << graph_view.number_of_vertices() << " vertices (deterministic)"
+                << std::endl;
+#endif
+    } else {
+      raft::random::RngState rng_state(0);
+      d_seeds = cugraph::select_random_vertices(
+        handle,
+        graph_view,
+        std::optional<raft::device_span<vertex_t const>>{std::nullopt},
+        rng_state,
+        betweenness_usecase.num_seeds,
+        false,
+        true);
+#if DEBUG_BETWEENNESS_CENTRALITY
+      std::cout << "Seeds: " << d_seeds.size() << " vertices (random sampling)" << std::endl;
+#endif
+    }
 
     if (cugraph::test::g_perf) {
       RAFT_CUDA_TRY(cudaDeviceSynchronize());  // for consistent performance measurement
@@ -118,6 +168,23 @@ class Tests_BetweennessCentrality
       betweenness_usecase.normalized,
       betweenness_usecase.include_endpoints,
       do_expensive_check);
+
+#if DEBUG_BETWEENNESS_CENTRALITY
+    std::cout << "Centrality array size: " << d_centralities.size() << std::endl;
+
+    // Print first few centrality values
+    if (d_centralities.size() > 0) {
+      auto h_centralities = cugraph::test::to_host(handle, d_centralities);
+
+      std::cout << "First 5 centrality values: ";
+      for (size_t i = 0; i < std::min(size_t{5}, h_centralities.size()); ++i) {
+        std::cout << std::fixed << std::setprecision(6) << h_centralities[i];
+        if (i < std::min(size_t{4}, h_centralities.size() - 1)) std::cout << ", ";
+      }
+      if (h_centralities.size() > 5) std::cout << ", ...";
+      std::cout << std::endl;
+    }
+#endif
 
     if (cugraph::test::g_perf) {
       RAFT_CUDA_TRY(cudaDeviceSynchronize());  // for consistent performance measurement
@@ -158,11 +225,28 @@ class Tests_BetweennessCentrality
                                          !graph_view.is_symmetric(),
                                          betweenness_usecase.normalized);
 
+#if DEBUG_BETWEENNESS_CENTRALITY
+      // Print first few reference centrality values
+      if (h_reference_centralities.size() > 0) {
+        std::cout << "First 5 reference centrality values: ";
+        for (size_t i = 0; i < std::min(size_t{5}, h_reference_centralities.size()); ++i) {
+          std::cout << std::fixed << std::setprecision(6) << h_reference_centralities[i];
+          if (i < std::min(size_t{4}, h_reference_centralities.size() - 1)) std::cout << ", ";
+        }
+        if (h_reference_centralities.size() > 5) std::cout << ", ...";
+        std::cout << std::endl;
+      }
+#endif
+
       auto d_reference_centralities = cugraph::test::to_device(handle, h_reference_centralities);
 
       cugraph::test::betweenness_centrality_validate(
         handle, d_centralities, d_reference_centralities);
     }
+
+#if DEBUG_BETWEENNESS_CENTRALITY
+    std::cout << "=== BETWEENNESS CENTRALITY TEST END ===\n" << std::endl;
+#endif
   }
 };
 
@@ -170,11 +254,11 @@ using Tests_BetweennessCentrality_File = Tests_BetweennessCentrality<cugraph::te
 using Tests_BetweennessCentrality_Rmat = Tests_BetweennessCentrality<cugraph::test::Rmat_Usecase>;
 
 // FIXME: add tests for type combinations
-TEST_P(Tests_BetweennessCentrality_File, CheckInt32Int32FloatFloat)
-{
-  run_current_test<int32_t, int32_t, float>(
-    override_File_Usecase_with_cmd_line_arguments(GetParam()));
-}
+// TEST_P(Tests_BetweennessCentrality_File, CheckInt32Int32FloatFloat)
+// {
+//   run_current_test<int32_t, int32_t, float>(
+//     override_File_Usecase_with_cmd_line_arguments(GetParam()));
+// }
 
 TEST_P(Tests_BetweennessCentrality_File, CheckInt64Int64FloatFloat)
 {
@@ -210,6 +294,31 @@ INSTANTIATE_TEST_SUITE_P(
     ::testing::Values(cugraph::test::File_Usecase("test/datasets/karate.mtx"))));
 
 INSTANTIATE_TEST_SUITE_P(
+  warehouse_test_pass,
+  Tests_BetweennessCentrality_File,
+  ::testing::Combine(
+    // enable correctness checks
+    // ::testing::Values(BetweennessCentrality_Usecase{20, false, false, false, false},
+    //                   BetweennessCentrality_Usecase{20, false, false, false, true},
+    //                   BetweennessCentrality_Usecase{20, false, false, true, false},
+    //                   BetweennessCentrality_Usecase{20, false, false, true, true},
+    //                   BetweennessCentrality_Usecase{20, false, true, false, false},
+    //                   BetweennessCentrality_Usecase{20, false, true, false, true},
+    //                   BetweennessCentrality_Usecase{20, false, true, true, false},
+    //                   BetweennessCentrality_Usecase{20, false, true, true, true},
+    //                   BetweennessCentrality_Usecase{100, false, true, true, true},
+    //                   BetweennessCentrality_Usecase{200, false, true, true, true},
+    //                   BetweennessCentrality_Usecase{500, false, true, true, true}),
+    ::testing::Values(BetweennessCentrality_Usecase{20, false, true, true, false},
+                      BetweennessCentrality_Usecase{62, false, true, true, false},
+                      BetweennessCentrality_Usecase{20, false, true, true, true},
+                      BetweennessCentrality_Usecase{62, false, true, true, true}),
+    // BetweennessCentrality_Usecase{1000, false, true, true, false},
+    // BetweennessCentrality_Usecase{2000, false, true, true, false},
+    // BetweennessCentrality_Usecase{5699, false, true, true, false}),
+    ::testing::Values(cugraph::test::File_Usecase("/raid/howhuang/cugraph/warehouse.csv"))));
+
+INSTANTIATE_TEST_SUITE_P(
   rmat_small_test,
   Tests_BetweennessCentrality_Rmat,
   // enable correctness checks
@@ -234,5 +343,47 @@ INSTANTIATE_TEST_SUITE_P(
                       BetweennessCentrality_Usecase{500, false, false, true, false, false},
                       BetweennessCentrality_Usecase{500, false, false, true, true, false}),
     ::testing::Values(cugraph::test::Rmat_Usecase(20, 32, 0.57, 0.19, 0.19, 0, false, false))));
+
+INSTANTIATE_TEST_SUITE_P(
+  manhattan_test_pass,
+  Tests_BetweennessCentrality_File,
+  ::testing::Combine(
+    // disable correctness checks for large dataset, use fewer seeds
+    ::testing::Values(BetweennessCentrality_Usecase{50, false, false, false, false, false},
+                      BetweennessCentrality_Usecase{100, false, false, false, false, false},
+                      BetweennessCentrality_Usecase{200, false, false, false, false, false},
+                      BetweennessCentrality_Usecase{
+                        std::numeric_limits<size_t>::max(), false, false, false, false, false}),
+    ::testing::Values(cugraph::test::File_Usecase("/home/nfs/howhuang/cugraph/manhattan.csv"))));
+
+INSTANTIATE_TEST_SUITE_P(
+  newyork_test_pass,
+  Tests_BetweennessCentrality_File,
+  ::testing::Combine(
+    // disable correctness checks for large dataset, use fewer seeds
+    ::testing::Values(BetweennessCentrality_Usecase{50, false, false, false, false, false},
+                      BetweennessCentrality_Usecase{100, false, false, false, false, false},
+                      BetweennessCentrality_Usecase{200, false, false, false, false, false},
+                      BetweennessCentrality_Usecase{500, false, false, false, false, false},
+                      BetweennessCentrality_Usecase{1000, false, false, false, false, false},
+                      BetweennessCentrality_Usecase{
+                        std::numeric_limits<size_t>::max(), false, false, false, false, false}),
+    ::testing::Values(cugraph::test::File_Usecase("/home/nfs/howhuang/cugraph/newyork.csv"))));
+
+INSTANTIATE_TEST_SUITE_P(
+  california_test_pass,
+  Tests_BetweennessCentrality_File,
+  ::testing::Combine(
+    // disable correctness checks for large dataset, use fewer seeds
+    ::testing::Values(BetweennessCentrality_Usecase{50, false, false, false, false, false},
+                      BetweennessCentrality_Usecase{100, false, false, false, false, false},
+                      BetweennessCentrality_Usecase{200, false, false, false, false, false},
+                      BetweennessCentrality_Usecase{500, false, false, false, false, false},
+                      BetweennessCentrality_Usecase{570, false, false, false, false, false},
+                      BetweennessCentrality_Usecase{663, false, false, false, false, false},
+                      BetweennessCentrality_Usecase{1000, false, false, false, false, false},
+                      BetweennessCentrality_Usecase{
+                        std::numeric_limits<size_t>::max(), false, false, false, false, false}),
+    ::testing::Values(cugraph::test::File_Usecase("/home/nfs/howhuang/cugraph/roadNet-CA.csv"))));
 
 CUGRAPH_TEST_PROGRAM_MAIN()

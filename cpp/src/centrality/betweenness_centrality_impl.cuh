@@ -33,6 +33,7 @@
 #include <cugraph/detail/utility_wrappers.hpp>
 #include <cugraph/edge_src_dst_property.hpp>
 #include <cugraph/utilities/error.hpp>
+#include <cugraph/utilities/host_scalar_comm.hpp>
 #include <cugraph/vertex_partition_device_view.cuh>
 
 #include <raft/core/handle.hpp>
@@ -49,6 +50,8 @@
 #include <thrust/reduce.h>
 #include <thrust/sort.h>
 #include <thrust/transform.h>
+
+#include <limits>
 
 //
 // The formula for BC(v) is the sum over all (s,t) where s != v != t of
@@ -1452,17 +1455,19 @@ rmm::device_uvector<weight_t> betweenness_centrality(
   bool const include_endpoints,
   bool const do_expensive_check)
 {
+  rmm::device_uvector<weight_t> centralities(0, handle.get_stream());
+
   if (vertices) {
-    return detail::betweenness_centrality(handle,
-                                          graph_view,
-                                          edge_weight_view,
-                                          vertices->begin(),
-                                          vertices->end(),
-                                          normalized,
-                                          include_endpoints,
-                                          do_expensive_check);
+    centralities = detail::betweenness_centrality(handle,
+                                                  graph_view,
+                                                  edge_weight_view,
+                                                  vertices->begin(),
+                                                  vertices->end(),
+                                                  normalized,
+                                                  include_endpoints,
+                                                  do_expensive_check);
   } else {
-    return detail::betweenness_centrality(
+    centralities = detail::betweenness_centrality(
       handle,
       graph_view,
       edge_weight_view,
@@ -1472,6 +1477,53 @@ rmm::device_uvector<weight_t> betweenness_centrality(
       include_endpoints,
       do_expensive_check);
   }
+
+  // Debug: Print non-zero centrality values and write to file
+  std::vector<weight_t> h_centralities(centralities.size());
+  raft::copy(h_centralities.data(), centralities.data(), centralities.size(), handle.get_stream());
+  handle.sync_stream();
+
+  // Write centrality values to file with test parameters
+  char filename[256];
+  size_t num_seeds   = vertices ? vertices->size() : graph_view.number_of_vertices();
+  bool has_edge_mask = graph_view.has_edge_mask();
+  snprintf(
+    filename,
+    sizeof(filename),
+    "centrality_results/centrality_seeds%zu_normalized%d_endpoints%d_weighted%d_masked%d.txt",
+    num_seeds,
+    normalized,
+    include_endpoints,
+    edge_weight_view.has_value(),
+    has_edge_mask);
+
+  // Create directory if it doesn't exist
+  system("mkdir -p centrality_results");
+
+  FILE* f = fopen(filename, "w");
+  if (f) {
+    fprintf(f, "%zu\n", h_centralities.size());
+    for (size_t i = 0; i < h_centralities.size(); ++i) {
+      fprintf(f, "%.6f\n", h_centralities[i]);
+    }
+    fclose(f);
+  }
+
+  int non_zero_count = 0;
+  for (size_t i = 0; i < h_centralities.size(); ++i) {
+    if (h_centralities[i] != 0.0) {
+      non_zero_count++;
+      if (non_zero_count <= 20) {  // Print first 20 non-zero values
+        fprintf(stderr, "Non-zero centrality[%zu] = %.6f\n", i, h_centralities[i]);
+      }
+    }
+  }
+  fprintf(stderr,
+          "Total non-zero centrality values: %d out of %zu\n",
+          non_zero_count,
+          h_centralities.size());
+
+  return centralities;
 }
 
 template <typename vertex_t, typename edge_t, typename weight_t, bool multi_gpu>
